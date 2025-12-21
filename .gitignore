@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Local venv
+.venv/
+
+# Runtime state (logs/history/users/update cache)
+var/
+runtime/
+
+# Local per-device config (generated on first run)
+config/client_config.json
+

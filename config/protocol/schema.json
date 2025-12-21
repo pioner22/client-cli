@@ -1,0 +1,106 @@
+{
+  "tables": {
+    "users": {
+      "columns": [
+        "id",
+        "salt",
+        "hash",
+        "display_name",
+        "handle",
+        "is_active",
+        "created_at",
+        "last_login_at"
+      ]
+    },
+    "boards": {
+      "columns": [
+        "id",
+        "owner_id",
+        "name",
+        "handle",
+        "visibility",
+        "created_at"
+      ]
+    },
+    "board_members": {
+      "columns": [
+        "board_id",
+        "user_id"
+      ]
+    },
+    "board_roles": {
+      "columns": [
+        "board_id",
+        "user_id",
+        "role"
+      ]
+    },
+    "groups": {
+      "columns": [
+        "id",
+        "owner_id",
+        "name",
+        "handle",
+        "created_at"
+      ]
+    },
+    "group_members": {
+      "columns": [
+        "group_id",
+        "user_id"
+      ]
+    },
+    "group_roles": {
+      "columns": [
+        "group_id",
+        "user_id",
+        "role"
+      ]
+    },
+    "friendships": {
+      "columns": [
+        "user_id",
+        "friend_id"
+      ]
+    },
+    "pending_requests": {
+      "columns": [
+        "user_id",
+        "requester_id"
+      ]
+    },
+    "presence": {
+      "columns": [
+        "user_id",
+        "is_online",
+        "session_started_at",
+        "last_seen_at",
+        "total_online_seconds"
+      ]
+    },
+    "messages": {
+      "columns": [
+        "id",
+        "sender_id",
+        "recipient_id",
+        "room",
+        "body",
+        "created_at",
+        "delivered_at",
+        "read_at"
+      ]
+    },
+    "mutes": {
+      "columns": [
+        "user_id",
+        "muted_id"
+      ]
+    },
+    "blocks": {
+      "columns": [
+        "user_id",
+        "blocked_id"
+      ]
+    }
+  }
+}

@@ -6,6 +6,8 @@ from typing import Optional, Tuple
 
 
 MAX_DISPLAY_NAME = 64
+MAX_STATUS_TEXT = 96
+MAX_BIO = 280
 HANDLE_RE = re.compile(r"^@[a-z0-9_]{3,16}$")
 
 
@@ -56,6 +58,49 @@ def validate_handle(handle: Optional[str]) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def normalize_status_text(status: Optional[str]) -> Optional[str]:
+    if status is None:
+        return None
+    status = _collapse_spaces(status.strip())
+    if not status:
+        return None
+    return status[:MAX_STATUS_TEXT]
+
+
+def validate_status_text(status: Optional[str]) -> Tuple[bool, Optional[str]]:
+    if status is None:
+        return True, None
+    if not str(status).strip():
+        return False, "empty"
+    if len(str(status)) > MAX_STATUS_TEXT:
+        return False, "too_long"
+    return True, None
+
+
+def normalize_bio(bio: Optional[str]) -> Optional[str]:
+    if bio is None:
+        return None
+    b = str(bio).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not b:
+        return None
+    # Collapse excessive whitespace, but keep newlines.
+    lines = [" ".join(line.split()) for line in b.split("\n")]
+    b2 = "\n".join(lines).strip()
+    if not b2:
+        return None
+    return b2[:MAX_BIO]
+
+
+def validate_bio(bio: Optional[str]) -> Tuple[bool, Optional[str]]:
+    if bio is None:
+        return True, None
+    if not str(bio).strip():
+        return False, "empty"
+    if len(str(bio)) > MAX_BIO:
+        return False, "too_long"
+    return True, None
+
+
 @dataclass
 class Profile:
     """Профиль пользователя поверх его уникального ID.
@@ -68,26 +113,40 @@ class Profile:
     id: str
     display_name: Optional[str] = None
     handle: Optional[str] = None
+    bio: Optional[str] = None
+    status: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def make_profile_set_payload(display_name: Optional[str], handle: Optional[str]) -> dict:
+def make_profile_set_payload(display_name: Optional[str], handle: Optional[str], bio: Optional[str] = None, status: Optional[str] = None) -> dict:
     """Сформировать NDJSON-пакет для обновления профиля (клиент → сервер)."""
     nd = normalize_display_name(display_name)
     nh = normalize_handle(handle)
+    nb = normalize_bio(bio)
+    ns = normalize_status_text(status)
     ok_name, err_name = validate_display_name(nd)
     if not ok_name:
         raise ValueError(f"invalid display_name: {err_name}")
     ok_handle, err_handle = validate_handle(nh)
     if not ok_handle:
         raise ValueError(f"invalid handle: {err_handle}")
+    ok_bio, err_bio = validate_bio(nb)
+    if not ok_bio:
+        raise ValueError(f"invalid bio: {err_bio}")
+    ok_status, err_status = validate_status_text(ns)
+    if not ok_status:
+        raise ValueError(f"invalid status: {err_status}")
     payload: dict = {"type": "profile_set"}
     if nd is not None:
         payload["display_name"] = nd
     if nh is not None:
         payload["handle"] = nh
+    if nb is not None:
+        payload["bio"] = nb
+    if ns is not None:
+        payload["status"] = ns
     return payload
 
 
@@ -97,5 +156,9 @@ __all__ = [
     "validate_display_name",
     "normalize_handle",
     "validate_handle",
+    "normalize_bio",
+    "validate_bio",
+    "normalize_status_text",
+    "validate_status_text",
     "make_profile_set_payload",
 ]

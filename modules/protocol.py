@@ -143,6 +143,8 @@ class T:
     BOARD_LEAVE_RESULT = "board_leave_result"
     BOARD_INVITE = "board_invite"
     BOARD_INVITE_RESULT = "board_invite_result"
+    BOARD_INVITE_RESPONSE = "board_invite_response"
+    BOARD_INVITE_RESPONSE_RESULT = "board_invite_response_result"
     BOARD_ADDED = "board_added"
     BOARD_UPDATED = "board_updated"
     BOARD_REMOVED = "board_removed"

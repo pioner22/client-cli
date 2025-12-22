@@ -1149,7 +1149,7 @@ except Exception:
     def get_file_system_suggestions(token: str, cwd=None, limit: int = 20):
         return []
 
-CLIENT_VERSION = "0.4.1398"
+CLIENT_VERSION = "0.4.1401"
 _VER_PART_RE = re.compile(r"\d+")
 
 
@@ -9807,6 +9807,27 @@ def main(stdscr):
                                 pass
                     except Exception:
                         pass
+            elif mtype == 'board_invite_response_result':
+                bid = str(msg.get('board_id') or '')
+                if msg.get('ok'):
+                    try:
+                        if bid:
+                            state.board_pending_invites.pop(bid, None)
+                    except Exception:
+                        pass
+                    try:
+                        acc = msg.get('accept')
+                        if acc is True:
+                            state.status = f"Приглашение принято: {bid}"
+                        elif acc is False:
+                            state.status = f"Приглашение отклонено: {bid}"
+                        else:
+                            state.status = "Приглашение обработано"
+                    except Exception:
+                        state.status = "Приглашение обработано"
+                else:
+                    state.status = f"Не удалось обработать приглашение: {msg.get('reason')}"
+                _touch_contact_rows(state)
             elif mtype == 'board_rename_result':
                 if msg.get('ok'):
                     bid = str(msg.get('board_id') or '')
@@ -14283,7 +14304,7 @@ def main(stdscr):
                 sel = int(getattr(state, 'board_invite_index', 0))
                 if sel == 0 and bid:
                     try:
-                        net.send({"type": "board_join", "board_id": bid})
+                        net.send({"type": "board_invite_response", "board_id": bid, "accept": True})
                         state.status = f"Принято приглашение в доску: {state.board_invite_name or bid}"
                     except Exception:
                         state.status = "Не удалось принять приглашение"
@@ -14295,6 +14316,11 @@ def main(stdscr):
                     state.status = "Приглашение отклонено"
                     try:
                         if bid:
+                            net.send({"type": "board_invite_response", "board_id": bid, "accept": False})
+                    except Exception:
+                        pass
+                    try:
+                        if bid:
                             state.board_pending_invites.pop(bid, None)
                     except Exception:
                         pass
@@ -14302,9 +14328,16 @@ def main(stdscr):
                 state.board_invite_bid = None
                 continue
             if ch in ('\x1b',) or ch == 27:
+                bid = state.board_invite_bid or ''
                 state.board_invite_mode = False
                 state.board_invite_bid = None
                 state.status = "Приглашение отклонено"
+                try:
+                    if bid:
+                        net.send({"type": "board_invite_response", "board_id": bid, "accept": False})
+                        state.board_pending_invites.pop(bid, None)
+                except Exception:
+                    pass
                 continue
         # When selecting a pending group invite token, open modal only on Enter
         # If selection is on a pending group invite token, open modal on Enter

@@ -1149,7 +1149,7 @@ except Exception:
     def get_file_system_suggestions(token: str, cwd=None, limit: int = 20):
         return []
 
-CLIENT_VERSION = "0.4.1401"
+CLIENT_VERSION = "0.4.1461"
 _VER_PART_RE = re.compile(r"\d+")
 
 
@@ -5069,7 +5069,7 @@ def draw_ui(stdscr, state: ClientState):
             stdscr.addch(yy, x + box_w, ord('|'))
 
         if state.auth_mode == 'login':
-            lbl0 = "ID: "
+            lbl0 = "ID/@логин: "
             lbl1 = "Пароль: "
             prefix0 = "> " if state.login_field == 0 else "  "
             prefix1 = "> " if state.login_field == 1 else "  "
@@ -9212,7 +9212,7 @@ def main(stdscr):
             elif mtype == 'auth_fail':
                 reason = msg.get('reason', 'unknown')
                 mapping = {
-                    'missing_id': 'Введите ID',
+                    'missing_id': 'Введите ID/@логин',
                     'no_such_user': 'Пользователь не найден',
                     'bad_password': 'Неверный пароль',
                     'rate_limited': 'Слишком много попыток. Подождите и попробуйте снова',
@@ -14466,7 +14466,7 @@ def main(stdscr):
                             state.login_field = 1
                         else:
                             if not state.id_input:
-                                state.login_msg = "Введите ID"
+                                state.login_msg = "Введите ID/@логин"
                             elif not state.pw1:
                                 state.login_msg = "Введите пароль"
                             else:

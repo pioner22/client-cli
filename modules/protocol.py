@@ -91,6 +91,12 @@ class T:
     # Update
     UPDATE_REQUIRED = "update_required"
 
+    # PWA Web Push
+    PWA_PUSH_SUBSCRIBE = "pwa_push_subscribe"
+    PWA_PUSH_SUBSCRIBE_RESULT = "pwa_push_subscribe_result"
+    PWA_PUSH_UNSUBSCRIBE = "pwa_push_unsubscribe"
+    PWA_PUSH_UNSUBSCRIBE_RESULT = "pwa_push_unsubscribe_result"
+
     # History / search
     HISTORY = "history"
     HISTORY_RESULT = "history_result"
@@ -114,6 +120,11 @@ class T:
     GROUP_DISBAND_RESULT = "group_disband_result"
     GROUP_INFO = "group_info"
     GROUP_INFO_RESULT = "group_info_result"
+    GROUP_SET_INFO = "group_set_info"
+    GROUP_SET_INFO_RESULT = "group_set_info_result"
+    GROUP_POST_SET = "group_post_set"
+    GROUP_POST_SET_RESULT = "group_post_set_result"
+    GROUP_POST_UPDATE = "group_post_update"
     GROUP_ADDED = "group_added"
     GROUP_UPDATED = "group_updated"
     GROUP_REMOVED = "group_removed"
@@ -133,6 +144,8 @@ class T:
     BOARD_DISBAND_RESULT = "board_disband_result"
     BOARD_INFO = "board_info"
     BOARD_INFO_RESULT = "board_info_result"
+    BOARD_SET_INFO = "board_set_info"
+    BOARD_SET_INFO_RESULT = "board_set_info_result"
     BOARD_RENAME = "board_rename"
     BOARD_RENAME_RESULT = "board_rename_result"
     BOARD_SET_HANDLE = "board_set_handle"

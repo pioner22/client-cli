@@ -70,3 +70,6 @@ make test
 
 - Не коммитьте `config/client_config.json` и содержимое `var/` — это локальное состояние.
 
+## License
+
+GPL-3.0-or-later. См. `LICENSE`.

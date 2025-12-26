@@ -88,6 +88,10 @@ class T:
     MESSAGE_READ_ACK = "message_read_ack"
     UNREAD_COUNTS = "unread_counts"
 
+    # Reactions (1 per user)
+    REACTION_SET = "reaction_set"
+    REACTION_UPDATE = "reaction_update"
+
     # Update
     UPDATE_REQUIRED = "update_required"
 

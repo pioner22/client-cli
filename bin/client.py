@@ -1149,7 +1149,7 @@ except Exception:
     def get_file_system_suggestions(token: str, cwd=None, limit: int = 20):
         return []
 
-CLIENT_VERSION = "0.4.1590"
+CLIENT_VERSION = "0.4.1592"
 _VER_PART_RE = re.compile(r"\d+")
 
 

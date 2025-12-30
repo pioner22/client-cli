@@ -87,6 +87,7 @@ class T:
     MESSAGE_READ = "message_read"
     MESSAGE_READ_ACK = "message_read_ack"
     UNREAD_COUNTS = "unread_counts"
+    ROOM_READS = "room_reads"
 
     # Reactions (1 per user)
     REACTION_SET = "reaction_set"

@@ -97,13 +97,14 @@ def main() -> int:
     if not base:
         print('[bootstrap] UPDATE_URL is not set', file=sys.stderr)
         return 2
-    # Warn if signature verification is disabled over an insecure URL
-    try:
-        insecure_dev = str(os.environ.get('ALLOW_INSECURE_DEV', '0')).strip().lower() in ('1', 'true', 'yes', 'on')
-        if _parse_pubkey_env() is None and base.strip().lower().startswith('http://') and not insecure_dev:
-            print('[bootstrap] WARNING: UPDATE_PUBKEY not set; running without manifest signature verification over HTTP. Set UPDATE_PUBKEY or ALLOW_INSECURE_DEV=1 for local testing.', file=sys.stderr)
-    except Exception:
-        pass
+    # Security: require manifest signature verification unless explicitly in insecure dev mode.
+    insecure_dev = str(os.environ.get('ALLOW_INSECURE_DEV', '0')).strip().lower() in ('1', 'true', 'yes', 'on')
+    pub = _parse_pubkey_env()
+    if pub is None and not insecure_dev:
+        print('[bootstrap] UPDATE_PUBKEY is required for manifest signature verification. Set UPDATE_PUBKEY (hex/base64) or ALLOW_INSECURE_DEV=1 for local testing.', file=sys.stderr)
+        return 7
+    if pub is None and insecure_dev:
+        print('[bootstrap] WARNING: ALLOW_INSECURE_DEV=1: running without manifest signature verification (development/testing only).', file=sys.stderr)
     mani_url = base.rstrip('/') + '/manifest.json'
     try:
         mani_req = urllib.request.Request(mani_url, headers={'User-Agent': 'yagodka-bootstrap'})
@@ -112,7 +113,6 @@ def main() -> int:
     except Exception as e:
         print(f'[bootstrap] Failed to fetch manifest.json: {e}', file=sys.stderr)
         return 3
-    pub = _parse_pubkey_env()
     if pub is not None:
         try:
             sig_req = urllib.request.Request(base.rstrip('/') + '/manifest.sig', headers={'User-Agent': 'yagodka-bootstrap'})

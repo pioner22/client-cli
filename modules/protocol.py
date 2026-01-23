@@ -84,6 +84,7 @@ class T:
     MESSAGE_DELIVERED = "message_delivered"
     MESSAGE_QUEUED = "message_queued"
     MESSAGE_BLOCKED = "message_blocked"
+    MESSAGE_DELIVERED_TO_DEVICE = "message_delivered_to_device"
     MESSAGE_READ = "message_read"
     MESSAGE_READ_ACK = "message_read_ack"
     UNREAD_COUNTS = "unread_counts"

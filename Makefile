@@ -3,7 +3,7 @@ PY ?= python3
 PY_BIN := $(if $(wildcard .venv/bin/python),.venv/bin/python,$(PY))
 CLIENT_BIN := bin/client.py
 DEFAULT_UPDATE_URL := https://yagodka.org:17778
-DEFAULT_SERVER := yagodka.org:7777
+DEFAULT_SERVER := yagodka.org:7778
 DEFAULT_PUBKEY := 2c832025b325c453270b8bd90c3ccf58cdf23077fa287f2cba0b1bdc215b51f5
 DEFAULT_DEPS := cryptography
 REQUIRED_DIRS := bin modules var
@@ -62,7 +62,7 @@ _run_inner:
 run-debug: deps ensure-structure ensure-client
 	@SERVER_URL="$(or $(SERVER),$(DEFAULT_SERVER))"; \
 	UPDATE_URL_USE="$(or $(UPDATE_URL),$(DEFAULT_UPDATE_URL))"; \
-	CLIENT_DEBUG_LOG=1 LOG_LEVEL=DEBUG SERVER_ADDR="$$SERVER_URL" UPDATE_URL="$$UPDATE_URL_USE" UPDATE_PUBKEY="$(or $(UPDATE_PUBKEY),$(DEFAULT_PUBKEY))" $(PY_BIN) $(CLIENT_BIN)
+	CLIENT_DEBUG_LOG=1 LOG_LEVEL=DEBUG $(MAKE) run SERVER="$$SERVER_URL" UPDATE_URL="$$UPDATE_URL_USE" UPDATE_PUBKEY="$(or $(UPDATE_PUBKEY),$(DEFAULT_PUBKEY))"
 
 update: deps ensure-structure
 	@if [ -z "$(UPDATE_URL)" ]; then UPDATE_URL=$(DEFAULT_UPDATE_URL); fi; \

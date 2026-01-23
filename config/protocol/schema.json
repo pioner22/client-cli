@@ -8,6 +8,7 @@
         "display_name",
         "handle",
         "is_active",
+        "prefs",
         "created_at",
         "last_login_at"
       ]
@@ -18,6 +19,8 @@
         "owner_id",
         "name",
         "handle",
+        "description",
+        "rules",
         "visibility",
         "created_at"
       ]
@@ -41,6 +44,8 @@
         "owner_id",
         "name",
         "handle",
+        "description",
+        "rules",
         "created_at"
       ]
     },
@@ -55,6 +60,13 @@
         "group_id",
         "user_id",
         "role"
+      ]
+    },
+    "group_post_bans": {
+      "columns": [
+        "group_id",
+        "user_id",
+        "created_at"
       ]
     },
     "friendships": {
@@ -76,6 +88,15 @@
         "session_started_at",
         "last_seen_at",
         "total_online_seconds"
+      ]
+    },
+    "sessions": {
+      "columns": [
+        "user_id",
+        "token_hash",
+        "issued_at",
+        "last_used_at",
+        "expires_at"
       ]
     },
     "messages": {
@@ -100,6 +121,61 @@
       "columns": [
         "user_id",
         "blocked_id"
+      ]
+    },
+    "client_integrity": {
+      "columns": [
+        "id",
+        "user_id",
+        "client_version",
+        "local_sha",
+        "server_sha",
+        "size_ok",
+        "hash_ok",
+        "created_at"
+      ]
+    },
+    "file_offers": {
+      "columns": [
+        "fid",
+        "sender",
+        "room",
+        "name",
+        "size",
+        "uploaded",
+        "upload_done",
+        "ts",
+        "path",
+        "accepted_json",
+        "delivered_json"
+      ]
+    },
+    "file_pending": {
+      "columns": [
+        "recipient",
+        "fid"
+      ]
+    },
+    "file_state": {
+      "columns": [
+        "id",
+        "state_json",
+        "updated_at"
+      ]
+    },
+    "web_push_subscriptions": {
+      "columns": [
+        "id",
+        "user_id",
+        "endpoint_hash",
+        "endpoint",
+        "p256dh",
+        "auth",
+        "expiration_time",
+        "user_agent",
+        "client_kind",
+        "created_at",
+        "updated_at"
       ]
     }
   }

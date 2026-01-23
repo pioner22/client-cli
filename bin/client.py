@@ -1149,7 +1149,7 @@ except Exception:
     def get_file_system_suggestions(token: str, cwd=None, limit: int = 20):
         return []
 
-CLIENT_VERSION = "0.4.1872"
+CLIENT_VERSION = "0.4.2094"
 _VER_PART_RE = re.compile(r"\d+")
 
 
@@ -3423,8 +3423,8 @@ def discover_server(timeout_per_try: float = 0.5) -> Optional[Tuple[str, int, bo
 
     # Try defaults (prod hosts only; localhost не используем как fallback)
     candidates = [
-        ("yagodka.org", 7777),
-        ("168.222.252.108", 7777),
+        ("yagodka.org", 7778),
+        ("168.222.252.108", 7778),
     ]
     for host, port in candidates:
         logging.getLogger('client').info("Probing server %s:%s", host, port)
@@ -7507,7 +7507,7 @@ def main(stdscr):
         # Нет доступного сервера: используем явный SERVER_ADDR или прод по умолчанию,
         # но не сохраняем и не переключаемся на localhost.
         logging.getLogger('client').warning("Server not found; will wait for it")
-        env_addr = os.environ.get('SERVER_ADDR', 'yagodka.org:7777')
+        env_addr = os.environ.get('SERVER_ADDR', 'yagodka.org:7778')
         try:
             if ':' in env_addr:
                 host, p = env_addr.rsplit(':', 1)
@@ -7933,7 +7933,6 @@ def main(stdscr):
                         chan = key
                         if chan:
                             state.conversations.setdefault(chan, []).append(ChatMessage('sys', text_line, time.time()))
-                        state.status = f"Входящий файл: {label}"
                 except Exception:
                     pass
             elif mtype == getattr(T, 'FILE_ACCEPT_NOTICE', 'file_accept_notice'):

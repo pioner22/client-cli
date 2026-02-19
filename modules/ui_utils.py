@@ -31,29 +31,45 @@ def _is_zero_width(ch: str) -> bool:
         return False
 
 
-def _wcwidth(ch: str) -> int:
-    # Resolve optional wcwidth backend once (avoid per-char import overhead).
-    # If wcwidth isn't installed, we fall back to a simple East Asian width heuristic.
+def _is_zero_or_combining(ch: str) -> bool:
+    try:
+        return _is_zero_width(ch) or unicodedata.combining(ch)
+    except Exception:
+        return False
+
+
+def _wcwidth_backend(ch: str) -> Optional[int]:
     global _WCWIDTH_FUNC
     try:
-        if _is_zero_width(ch) or unicodedata.combining(ch):
-            return 0
-    except Exception:
-        pass
-    try:
         fn = _WCWIDTH_FUNC
-        if fn is not None:
-            w = fn(ch)
-            if w is not None and w >= 0:
-                return int(w)
+        if fn is None:
+            return None
+        w = fn(ch)
+        if w is not None and w >= 0:
+            return int(w)
     except Exception:
-        pass
+        return None
+    return None
+
+
+def _wcwidth_east_asian(ch: str) -> int:
     try:
         if unicodedata.east_asian_width(ch) in ("W", "F"):
             return 2
     except Exception:
         pass
     return 1
+
+
+def _wcwidth(ch: str) -> int:
+    # Resolve optional wcwidth backend once (avoid per-char import overhead).
+    # If wcwidth isn't installed, we fall back to a simple East Asian width heuristic.
+    if _is_zero_or_combining(ch):
+        return 0
+    backend = _wcwidth_backend(ch)
+    if backend is not None:
+        return backend
+    return _wcwidth_east_asian(ch)
 
 
 def _load_wcwidth_func():

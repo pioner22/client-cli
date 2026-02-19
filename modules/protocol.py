@@ -73,6 +73,7 @@ class T:
     AVATAR = "avatar"
     PREFS = "prefs"
     PREFS_GET = "prefs_get"
+    PREFS_SET = "prefs_set"
     MUTE_SET = "mute_set"
     MUTE_SET_RESULT = "mute_set_result"
     BLOCK_SET = "block_set"
@@ -109,6 +110,10 @@ class T:
     SEARCH = "search"
     SEARCH_RESULT = "search_result"
     LIST = "list"
+
+    # History management
+    ROOM_CLEAR = "room_clear"
+    ROOM_CLEARED = "room_cleared"
 
     # Groups
     GROUPS = "groups"
@@ -181,6 +186,17 @@ class T:
     FILE_ACCEPT_NOTICE = "file_accept_notice"  # server -> sender: recipient accepted
     FILE_RECEIVED = "file_received"            # server -> sender: recipient finished download
     FILE_GET = "file_get"                      # request (re)download: {file_id}
+    FILE_PREVIEW_READY = "file_preview_ready"  # server -> users: thumb/meta ready (clients should re-fetch file_url)
+
+    # Calls (signaling for WebRTC/Jitsi)
+    CALL_CREATE = "call_create"
+    CALL_CREATE_RESULT = "call_create_result"
+    CALL_INVITE = "call_invite"
+    CALL_INVITE_ACK = "call_invite_ack"
+    CALL_ACCEPT = "call_accept"
+    CALL_REJECT = "call_reject"
+    CALL_END = "call_end"
+    CALL_STATE = "call_state"
 
     # Authorization (friendship) — values from module.authorization
     AUTHZ_REQUEST = AUTHZ_REQUEST

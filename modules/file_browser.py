@@ -17,24 +17,20 @@ import time
 Entry = Tuple[str, bool]  # (name, is_dir)
 
 
-def list_dir(path: Union[str, Path], *, return_err: bool = False) -> Union[Tuple[List[Entry], Optional[str]], List[Entry]]:
-    """Return directory listing including '..' as the first entry when possible, plus error string.
-
-    - Returns entries sorted by name (case‑insensitive)
-    - Hidden files (starting with '.') are included
-    - On any error returns a minimal listing with only '..' when applicable and error message
-    """
+def _resolve_list_path(path: Union[str, Path]) -> Path:
     try:
-        p = Path(path).expanduser().resolve()
+        return Path(path).expanduser().resolve()
     except Exception:
-        p = Path(".").resolve()
+        return Path(".").resolve()
+
+
+def _scan_entries(path: Path) -> Tuple[List[Entry], Optional[str]]:
     items: List[Entry] = []
     err: Optional[str] = None
     try:
-        names = sorted(os.listdir(p), key=lambda s: s.lower())
+        names = sorted(os.listdir(path), key=lambda s: s.lower())
         for name in names:
-            full = p / name
-            is_dir = False
+            full = path / name
             try:
                 is_dir = full.is_dir()
             except Exception:
@@ -49,14 +45,82 @@ def list_dir(path: Union[str, Path], *, return_err: bool = False) -> Union[Tuple
     except Exception as e:
         err = str(e)
         items = []
-    # Prepend '..' if parent exists and is different
+    return items, err
+
+
+def _prepend_parent(items: List[Entry], path: Path) -> List[Entry]:
+    out = list(items)
     try:
-        parent = p.parent
-        if parent and parent != p:
-            items.insert(0, ('..', True))
+        parent = path.parent
+        if parent and parent != path:
+            out.insert(0, ("..", True))
     except Exception:
         pass
+    return out
+
+
+def list_dir(path: Union[str, Path], *, return_err: bool = False) -> Union[Tuple[List[Entry], Optional[str]], List[Entry]]:
+    """Return directory listing including '..' as the first entry when possible, plus error string.
+
+    - Returns entries sorted by name (case‑insensitive)
+    - Hidden files (starting with '.') are included
+    - On any error returns a minimal listing with only '..' when applicable and error message
+    """
+    p = _resolve_list_path(path)
+    items, err = _scan_entries(p)
+    items = _prepend_parent(items, p)
     return (items, err) if return_err else items
+
+
+def _filter_base_items(base_items: List[Entry], *, show_hidden: bool, view: Optional[str]) -> tuple[Optional[Entry], List[Entry]]:
+    parent_row: Optional[Entry] = None
+    items: List[Entry] = []
+    for name, is_dir in base_items:
+        if name == "..":
+            parent_row = ("..", True)
+            continue
+        if (not show_hidden) and name.startswith("."):
+            continue
+        if view == "dirs" and (not is_dir):
+            continue
+        if view == "files" and is_dir:
+            continue
+        items.append((name, is_dir))
+    return parent_row, items
+
+
+def _mtime_key_factory(path: Union[str, Path], sort: str):
+    base = Path(path).expanduser()
+
+    def _mtime_key(entry: Entry) -> float:
+        try:
+            full = base / entry[0]
+            st = full.stat()
+            if sort in ("mtime", "modified"):
+                return st.st_mtime
+            if sort in ("created",):
+                ts = getattr(st, "st_birthtime", None)
+                return float(ts if ts is not None else st.st_ctime)
+            return st.st_ctime
+        except Exception:
+            return 0.0
+
+    return _mtime_key
+
+
+def _sort_items(items: List[Entry], *, path: Union[str, Path], sort: str, reverse: bool) -> List[Entry]:
+    out = list(items)
+    if sort in ("mtime", "modified", "ctime", "created", "changed", "added"):
+        out.sort(key=_mtime_key_factory(path, sort), reverse=reverse)
+    else:
+        out.sort(key=lambda e: e[0].lower(), reverse=reverse)
+    return out
+
+
+def _apply_dirs_first(items: List[Entry], dirs_first: bool) -> List[Entry]:
+    if not dirs_first:
+        return items
+    return [e for e in items if e[1]] + [e for e in items if not e[1]]
 
 
 def list_dir_opts(
@@ -79,42 +143,9 @@ def list_dir_opts(
     Returns list by default; set return_err=True to also get error text.
     """
     base_items, err = list_dir(path, return_err=True)
-    items: List[Entry] = []
-    parent_row: Optional[Entry] = None
-    for name, is_dir in base_items:
-        if name == '..':
-            parent_row = ('..', True)
-            continue
-        if (not show_hidden) and name.startswith('.'):
-            continue
-        if view == 'dirs' and (not is_dir):
-            continue
-        if view == 'files' and is_dir:
-            continue
-        items.append((name, is_dir))
-    # Sorting
-    if sort in ('mtime', 'modified', 'ctime', 'created', 'changed', 'added'):
-        p = Path(path).expanduser()
-        def mtime_key(entry: Entry) -> float:
-            try:
-                full = (p / entry[0])
-                st = full.stat()
-                if sort in ('mtime', 'modified'):
-                    return st.st_mtime
-                if sort in ('created',):
-                    # Prefer birthtime when available (macOS); fallback to ctime
-                    ts = getattr(st, 'st_birthtime', None)
-                    return float(ts if ts is not None else st.st_ctime)
-                # changed/added/ctime – best effort via st_ctime
-                return st.st_ctime
-            except Exception:
-                return 0.0
-        items.sort(key=mtime_key, reverse=reverse)
-    else:
-        items.sort(key=lambda e: e[0].lower(), reverse=reverse)
-    if dirs_first:
-        items = [e for e in items if e[1]] + [e for e in items if not e[1]]
-    # Prepend parent row
+    parent_row, items = _filter_base_items(base_items, show_hidden=show_hidden, view=view)
+    items = _sort_items(items, path=path, sort=sort, reverse=reverse)
+    items = _apply_dirs_first(items, dirs_first)
     if parent_row is not None:
         items.insert(0, parent_row)
     return (items, err) if return_err else items
@@ -243,12 +274,9 @@ def init_browser(start: Optional[Union[str, Path]] = None) -> FileBrowserState:
     return FileBrowserState(0, base, base)
 
 
-def handle_key(state: FileBrowserState, key: str) -> Tuple[FileBrowserState, Optional[str]]:
-    """Apply key: 'UP','DOWN','LEFT','RIGHT','TAB','ENTER','BACKSPACE','ESC'.
-    Returns (new_state, chosen_file_path).
-    """
-    key = key.upper()
-    s = FileBrowserState(
+def _clone_for_key(state: FileBrowserState) -> FileBrowserState:
+    # Keep constructor shape to preserve existing behavior.
+    return FileBrowserState(
         side=state.side,
         path0=state.path0,
         path1=state.path1,
@@ -257,71 +285,123 @@ def handle_key(state: FileBrowserState, key: str) -> Tuple[FileBrowserState, Opt
         index0=state.index0,
         index1=state.index1,
     )
+
+
+def _active_pane_values(s: FileBrowserState) -> tuple[List[Entry], int, str, Optional[str], Optional[str]]:
+    items = s.items0 if s.side == 0 else s.items1
+    idx = s.index0 if s.side == 0 else s.index1
+    path = s.path0 if s.side == 0 else s.path1
+    err = s.err0 if s.side == 0 else s.err1
+    last_dir = s.last_dir0 if s.side == 0 else s.last_dir1
+    return items, idx, path, err, last_dir
+
+
+def _reload_active_items(s: FileBrowserState, path: str) -> tuple[List[Entry], Optional[str]]:
+    if s.side == 0:
+        return list_dir_opts(
+            path,
+            show_hidden=s.show_hidden0,
+            sort=s.sort0,
+            dirs_first=s.dirs_first0,
+            reverse=s.reverse0,
+            view=s.view0,
+            return_err=True,
+        )
+    return list_dir_opts(
+        path,
+        show_hidden=s.show_hidden1,
+        sort=s.sort1,
+        dirs_first=s.dirs_first1,
+        reverse=s.reverse1,
+        view=s.view1,
+        return_err=True,
+    )
+
+
+def _cycle_index(idx: int, items: List[Entry], delta: int) -> int:
+    if not items:
+        return idx
+    return (idx + delta) % len(items)
+
+
+def _index_for_last_dir(items: List[Entry], last_dir: Optional[str]) -> int:
+    if not last_dir:
+        return 0
+    try:
+        names = [n for n, _ in items]
+        return names.index(last_dir) if last_dir in names else 0
+    except Exception:
+        return 0
+
+
+def _handle_parent_nav(s: FileBrowserState, act_path: str, last_dir: Optional[str]) -> tuple[str, List[Entry], Optional[str], int]:
+    new_path, _ = open_entry(act_path, "..")
+    items, err = _reload_active_items(s, new_path)
+    idx = _index_for_last_dir(items, last_dir)
+    return new_path, items, err, idx
+
+
+def _handle_enter_nav(
+    s: FileBrowserState,
+    act_items: List[Entry],
+    act_idx: int,
+    act_path: str,
+    last_dir: Optional[str],
+) -> tuple[str, List[Entry], Optional[str], int, Optional[str], Optional[str]]:
+    name, is_dir = act_items[max(0, min(act_idx, len(act_items) - 1))]
+    if not (is_dir or name == ".."):
+        _, chosen = open_entry(act_path, name)
+        return act_path, act_items, None, act_idx, last_dir, chosen
+    new_path, _ = open_entry(act_path, name)
+    new_last = name if name not in ("..",) else last_dir
+    items, err = _reload_active_items(s, new_path)
+    return new_path, items, err, 0, new_last, None
+
+
+def _write_back_active(
+    s: FileBrowserState,
+    *,
+    path: str,
+    items: List[Entry],
+    idx: int,
+    err: Optional[str],
+    last_dir: Optional[str],
+) -> None:
+    if s.side == 0:
+        s.path0, s.items0, s.index0 = path, items, idx
+        s.err0 = err
+        s.last_dir0 = last_dir
+        return
+    s.path1, s.items1, s.index1 = path, items, idx
+    s.err1 = err
+    s.last_dir1 = last_dir
+
+
+def handle_key(state: FileBrowserState, key: str) -> Tuple[FileBrowserState, Optional[str]]:
+    """Apply key: 'UP','DOWN','LEFT','RIGHT','TAB','ENTER','BACKSPACE','ESC'.
+    Returns (new_state, chosen_file_path).
+    """
+    key = key.upper()
+    s = _clone_for_key(state)
     if key == 'TAB':
         s.side = 1 - s.side
         return s, None
-    # Choose active pane
-    act_items = s.items0 if s.side == 0 else s.items1
-    act_idx = s.index0 if s.side == 0 else s.index1
-    act_path = s.path0 if s.side == 0 else s.path1
-    act_err = s.err0 if s.side == 0 else s.err1
-    last_dir = s.last_dir0 if s.side == 0 else s.last_dir1
+    act_items, act_idx, act_path, act_err, last_dir = _active_pane_values(s)
     if key in ('UP',):
-        if act_items:
-            act_idx = (act_idx - 1) % len(act_items)
+        act_idx = _cycle_index(act_idx, act_items, -1)
     elif key in ('DOWN',):
-        if act_items:
-            act_idx = (act_idx + 1) % len(act_items)
+        act_idx = _cycle_index(act_idx, act_items, 1)
     elif key in ('BACKSPACE', 'LEFT'):
-        # go up
-        newp, _ = open_entry(act_path, '..')
-        act_path = newp
-        # apply pane-specific prefs
-        if s.side == 0:
-            act_items, act_err = list_dir_opts(act_path, show_hidden=s.show_hidden0, sort=s.sort0, dirs_first=s.dirs_first0, reverse=s.reverse0, view=s.view0, return_err=True)
-        else:
-            act_items, act_err = list_dir_opts(act_path, show_hidden=s.show_hidden1, sort=s.sort1, dirs_first=s.dirs_first1, reverse=s.reverse1, view=s.view1, return_err=True)
-        # try reselect last visited dir in parent
-        if last_dir:
-            try:
-                names = [n for n, _ in act_items]
-                if last_dir in names:
-                    act_idx = names.index(last_dir)
-                else:
-                    act_idx = 0
-            except Exception:
-                act_idx = 0
-        else:
-            act_idx = 0
+        act_path, act_items, act_err, act_idx = _handle_parent_nav(s, act_path, last_dir)
     elif key in ('ENTER', 'RIGHT'):
         if not act_items:
             return s, None
-        name, is_dir = act_items[max(0, min(act_idx, len(act_items) - 1))]
-        if is_dir or name == '..':
-            newp, _ = open_entry(act_path, name)
-            act_path = newp
-            # remember last visited dir to restore selection on parent
-            last_dir = name if name not in ('..',) else last_dir
-            if s.side == 0:
-                act_items, act_err = list_dir_opts(act_path, show_hidden=s.show_hidden0, sort=s.sort0, dirs_first=s.dirs_first0, reverse=s.reverse0, view=s.view0, return_err=True)
-            else:
-                act_items, act_err = list_dir_opts(act_path, show_hidden=s.show_hidden1, sort=s.sort1, dirs_first=s.dirs_first1, reverse=s.reverse1, view=s.view1, return_err=True)
-            act_idx = 0
-        else:
-            # choose file
-            _, chosen = open_entry(act_path, name)
+        act_path, act_items, act_err, act_idx, last_dir, chosen = _handle_enter_nav(s, act_items, act_idx, act_path, last_dir)
+        if chosen:
             return s, chosen
     elif key in ('ESC',):
         return s, None
-    # Write back
-    if s.side == 0:
-        s.path0, s.items0, s.index0 = act_path, act_items, act_idx
-        s.err0 = act_err
-        s.last_dir0 = last_dir
-    else:
-        s.path1, s.items1, s.index1 = act_path, act_items, act_idx
-        s.err1 = act_err
-        s.last_dir1 = last_dir
+    _write_back_active(s, path=act_path, items=act_items, idx=act_idx, err=act_err, last_dir=last_dir)
     return s, None
 
 

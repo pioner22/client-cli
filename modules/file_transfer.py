@@ -23,6 +23,17 @@ from typing import Generator, Iterable, Optional, Tuple, Union
 # Default payload-safe chunk size (bytes before base64). Keep below MSG_MAX_BYTES.
 DEFAULT_CHUNK_SIZE = 32 * 1024  # 32 KiB
 
+_QUOTE_LEFT = "\"'«“„””"
+_QUOTE_RIGHT = "\"'»“„””"
+_TRAILING_MARKS = set(list(".,;:!?✓…") + [")", "]", "}", "»", "”", "’"])
+_ABS_PATH_RE = re.compile(r"""(?:^|\s|[\[\(\{"'«»“”„])((?:[A-Za-z]:)?[/\\][^\s\]\)"'«»“”„]+?\.(?:[A-Za-z0-9]{1,6}))""")
+_REL_PATH_RE = re.compile(r"""(?:^|\s|[\[\(\{"'«»“”„])((?:\./|\.\./)?(?:[A-Za-z0-9._-]+[/\\])+[A-Za-z0-9._-]+\.(?:[A-Za-z0-9]{1,6}))""")
+_NAME_PATH_RE = re.compile(
+    r"([A-Za-z0-9._-]+\.(?:png|jpe?g|gif|webp|bmp|pdf|txt|zip|tar|gz|7z|mp4|mov|mkv))",
+    re.IGNORECASE,
+)
+_GENERAL_PATH_RE = re.compile(r"""(?:^|\s|[\[\(\{"'«»“”„])((?:[A-Za-z]:)?[/\\][^\s\]\)"'«»“”„]+)""")
+
 
 @dataclass
 class FileMeta:
@@ -59,6 +70,32 @@ def is_path_like(token: str) -> bool:
     return (os.sep in t) or ('/' in t) or ('\\' in t)
 
 
+def _strip_wrapping_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] in _QUOTE_LEFT and value[-1] in _QUOTE_RIGHT:
+        return value[1:-1].strip()
+    return value
+
+
+def _strip_trailing_marks(value: str) -> str:
+    out = value
+    while len(out) > 1 and out[-1] in _TRAILING_MARKS:
+        out = out[:-1].strip()
+    return out
+
+
+def _sanitize_path_candidate(value: str) -> str:
+    if not isinstance(value, str):
+        return value
+    return _strip_trailing_marks(_strip_wrapping_quotes(value.strip()))
+
+
+def _find_last_regex_hit(pattern: re.Pattern[str], text: str) -> Optional[str]:
+    hits = pattern.findall(text)
+    if not hits:
+        return None
+    return _sanitize_path_candidate(hits[-1])
+
+
 def extract_path_candidate(text: str) -> Optional[str]:
     """Extract a plausible filesystem path from a text message.
 
@@ -70,53 +107,35 @@ def extract_path_candidate(text: str) -> Optional[str]:
     s = (text or '').strip()
     if not s:
         return None
-    def _sanitize(p: str) -> str:
-        if not isinstance(p, str):
-            return p
-        t = p.strip()
-        # Снимем обрамляющие кавычки
-        if len(t) >= 2 and t[0] in "\"'«“„””" and t[-1] in "\"'»“„””":
-            t = t[1:-1].strip()
-        # Удалим хвостовые не-символьные маркеры (пунктуация/галочки/многоточия)
-        trail = set(list('.,;:!?✓…') + [')', ']', '}', '»', '”', '’'])
-        while len(t) > 1 and t[-1] in trail:
-            t = t[:-1]
-            t = t.strip()
-        return t
 
     # 1) Прямая передача: вся строка — это путь
     if is_path_like(s):
-        return _sanitize(s)
+        return _sanitize_path_candidate(s)
     # 2) Поиск абсолютных/относительных путей внутри текста (последний)
     #    - Unix/Posix: /..., ./..., ../...
     #    - Windows: C:\..., \\server\share\...
     # Учитываем кавычки и скобки в качестве разделителей вокруг пути
-    # Абсолютные пути (Unix/Windows)
-    abs_pat = re.compile(r'''(?:^|\s|[\[\(\{"'«»“”„])((?:[A-Za-z]:)?[/\\][^\s\]\)"'«»“”„]+?\.(?:[A-Za-z0-9]{1,6}))''')
-    hits = abs_pat.findall(s)
-    if hits:
-        return _sanitize(hits[-1])
+    hit = _find_last_regex_hit(_ABS_PATH_RE, s)
+    if hit:
+        return hit
     # Относительные пути с каталогами
-    rel_pat = re.compile(r'''(?:^|\s|[\[\(\{"'«»“”„])((?:\./|\.\./)?(?:[A-Za-z0-9._-]+[/\\])+[A-Za-z0-9._-]+\.(?:[A-Za-z0-9]{1,6}))''')
-    hits = rel_pat.findall(s)
-    if hits:
-        return _sanitize(hits[-1])
+    hit = _find_last_regex_hit(_REL_PATH_RE, s)
+    if hit:
+        return hit
     # 3) Имя файла в скобках/тексте (без каталогов), если похоже на файл по расширению
-    name_pat = re.compile(r"([A-Za-z0-9._-]+\.(?:png|jpe?g|gif|webp|bmp|pdf|txt|zip|tar|gz|7z|mp4|mov|mkv))", re.IGNORECASE)
-    hits = name_pat.findall(s)
-    if hits:
-        return _sanitize(hits[-1])
+    hit = _find_last_regex_hit(_NAME_PATH_RE, s)
+    if hit:
+        return hit
     # 4) Общий абсолютный/UNC путь без требования расширения (последний)
     #    Пример: /Users/user/file (с любым допустимым именем), C:\\path\\to\\file
-    general_pat = re.compile(r'''(?:^|\s|[\[\(\{"'«»“”„])((?:[A-Za-z]:)?[/\\][^\s\]\)"'«»“”„]+)''')
-    hits = general_pat.findall(s)
-    if hits:
-        return _sanitize(hits[-1])
+    hit = _find_last_regex_hit(_GENERAL_PATH_RE, s)
+    if hit:
+        return hit
     # 5) Fallback: последний токен как путь, если выглядит как путь
     parts = [p for p in s.replace('\n', ' ').split(' ') if p]
     for tok in reversed(parts):
         if is_path_like(tok):
-            return _sanitize(tok)
+            return _sanitize_path_candidate(tok)
     return None
 
 
@@ -137,6 +156,32 @@ def file_meta_for(path: Union[str, os.PathLike[str]]) -> Optional[FileMeta]:
         return None
 
 
+def _basename_only(name: str, default: str) -> str:
+    s = str(name or "").strip()
+    s = s.replace("\\", "/").split("/")[-1].strip()
+    if not s or s in (".", ".."):
+        return default
+    return s
+
+
+def _sanitize_filename_charset(name: str, default: str) -> str:
+    try:
+        out = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    except Exception:
+        out = default
+    if not out or out in (".", ".."):
+        return default
+    return out
+
+
+def _truncate_filename(name: str, *, max_len: int = 128, max_ext: int = 16) -> str:
+    if len(name) <= max_len:
+        return name
+    root, ext = os.path.splitext(name)
+    ext = ext[:max_ext]
+    return (root[: max(1, max_len - len(ext))] + ext)[:max_len]
+
+
 def sanitize_remote_filename(name: str, *, default: str = "file") -> str:
     """Return a safe basename for a remote-provided filename.
 
@@ -144,32 +189,15 @@ def sanitize_remote_filename(name: str, *, default: str = "file") -> str:
     strips control/special characters that may break the terminal UI.
     """
     try:
-        s = str(name or "")
+        safe = _basename_only(str(name or ""), default)
     except Exception:
-        s = ""
-    s = s.strip()
-    # Normalize path separators and keep only basename.
-    s = s.replace("\\", "/").split("/")[-1].strip()
-    if not s or s in (".", ".."):
-        s = default
-    # Replace unsafe characters; keep a conservative charset.
+        safe = default
+    safe = _sanitize_filename_charset(safe, default)
     try:
-        s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
-    except Exception:
-        # If regex fails, fall back to a constant safe name.
-        s = default
-    if not s or s in (".", ".."):
-        s = default
-    # Keep filenames reasonably short to avoid filesystem/path issues.
-    try:
-        max_len = 128
-        if len(s) > max_len:
-            root, ext = os.path.splitext(s)
-            ext = ext[:16]
-            s = (root[: max(1, max_len - len(ext))] + ext)[:max_len]
+        safe = _truncate_filename(safe, max_len=128, max_ext=16)
     except Exception:
         pass
-    return s
+    return safe
 
 
 def iter_base64_chunks(p: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> Generator[Tuple[int, str], None, None]:

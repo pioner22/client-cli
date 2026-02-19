@@ -37,6 +37,43 @@ def _word_bounds(text: str, sel_start: int, sel_end: int, caret: int) -> Tuple[i
     return (caret, caret) if left == right else (left, right)
 
 
+def _format_link(segment: str, link_text: str, link_url: str) -> str:
+    label = (link_text or segment or link_url or "").strip()
+    url = (link_url or "").strip()
+    if not label and segment:
+        label = segment
+    if not label and url:
+        label = url
+    if url:
+        formatted = f"[{label or 'link'}]({url})"
+    else:
+        formatted = label or segment
+    if segment and segment.isspace():
+        return segment + formatted + " "
+    return formatted
+
+
+def _apply_case(kind: str, segment: str, text: str) -> str:
+    source = segment or text
+    if kind == "upper":
+        return source.upper()
+    if kind == "lower":
+        return source.lower()
+    return segment
+
+
+def _format_segment(kind: str, segment: str, text: str, link_text: str, link_url: str) -> str:
+    if kind == "bold":
+        return f"**{segment or 'текст'}**"
+    if kind == "italic":
+        return f"_{segment or 'текст'}_"
+    if kind == "link":
+        return _format_link(segment, link_text, link_url)
+    if kind in ("upper", "lower"):
+        return _apply_case(kind, segment, text)
+    return segment
+
+
 def apply_format(
     kind: str,
     text: str,
@@ -50,31 +87,7 @@ def apply_format(
     text = text or ""
     a, b = _word_bounds(text, sel_start, sel_end, caret)
     segment = text[a:b]
-
-    if kind == "bold":
-        formatted = f"**{segment or 'текст'}**"
-    elif kind == "italic":
-        formatted = f"_{segment or 'текст'}_"
-    elif kind == "link":
-        label = (link_text or segment or link_url or "").strip()
-        url = (link_url or "").strip()
-        if not label and segment:
-            label = segment
-        if not label and url:
-            label = url
-        if url:
-            formatted = f"[{label or 'link'}]({url})"
-        else:
-            formatted = label or segment
-        # Preserve surrounding space when the original span was whitespace
-        if segment and segment.isspace():
-            formatted = segment + formatted + " "
-    elif kind == "upper":
-        formatted = (segment or text).upper()
-    elif kind == "lower":
-        formatted = (segment or text).lower()
-    else:
-        formatted = segment
+    formatted = _format_segment(kind, segment, text, link_text, link_url)
 
     new_text = text[:a] + formatted + text[b:]
     if kind == "link" and segment and segment.isspace():

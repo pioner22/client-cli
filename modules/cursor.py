@@ -14,39 +14,77 @@ class CursorController:
       ctrl.apply(stdscr)      # once at the end, after drawing overlays
     """
 
-    def __init__(self, shape: Optional[int] = None):
-        # Cursor style handling via DECSCUSR (CSI Ps q):
-        # 1/2 block, 3/4 underline, 5/6 bar. We'll default to steady thin bar (6).
+    @staticmethod
+    def _read_env_prefs() -> tuple[Optional[str], str, bool]:
         try:
             from os import getenv
+
             env_shape = getenv("CURSOR_SHAPE")
-            env_style = getenv("CURSOR_STYLE", "bar").strip().lower()  # block|underline|bar
+            env_style = getenv("CURSOR_STYLE", "bar").strip().lower()
             env_blink = getenv("CURSOR_BLINK")
         except Exception:
-            env_shape = None
-            env_style = "bar"
-            env_blink = None
+            return None, "bar", False
+        prefer_blink = sys.platform.startswith("darwin")
+        if env_blink is not None:
+            prefer_blink = str(env_blink).strip().lower() in ("1", "true", "yes", "on")
+        return env_shape, env_style, prefer_blink
+
+    @staticmethod
+    def _resolve_shape(shape: Optional[int], env_shape: Optional[str]) -> int:
         if env_shape is not None:
             try:
                 shape = int(env_shape)
             except Exception:
                 shape = None
-        self._shape = 2 if shape not in (0, 1) else int(shape)
-        # Map style to steady code; blinking handled by caller if desired
-        # Blinking preference: default to blinking on macOS terminals
+        return 2 if shape not in (0, 1) else int(shape)
+
+    @staticmethod
+    def _style_code_for(style: str, prefer_blink: bool) -> int:
+        # Cursor style handling via DECSCUSR (CSI Ps q):
+        # 1/2 block, 3/4 underline, 5/6 bar. Default: steady thin bar (6).
+        if style == "block":
+            return 1 if prefer_blink else 2
+        if style == "underline":
+            return 3 if prefer_blink else 4
+        return 5 if prefer_blink else 6
+
+    @staticmethod
+    def _show_cursor(vis: int) -> None:
         try:
-            prefer_blink = sys.platform.startswith('darwin')
-            if env_blink is not None:
-                prefer_blink = str(env_blink).strip().lower() in ('1','true','yes','on')
+            curses.curs_set(2 if vis >= 2 else 1)
+            return
         except Exception:
-            prefer_blink = False
-        # Map style to DECSCUSR code; pick blinking variant when preferred
-        if env_style == 'block':
-            self._style_code = 1 if prefer_blink else 2
-        elif env_style == 'underline':
-            self._style_code = 3 if prefer_blink else 4
-        else:  # 'bar' or unknown
-            self._style_code = 5 if prefer_blink else 6
+            pass
+        try:
+            sys.stdout.write("\x1b[?25h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _hide_cursor() -> None:
+        try:
+            curses.curs_set(0)
+            return
+        except Exception:
+            pass
+        try:
+            sys.stdout.write("\x1b[?25l")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _move_cursor(stdscr, y: int, x: int) -> None:
+        try:
+            stdscr.move(int(y), int(x))
+        except Exception:
+            pass
+
+    def __init__(self, shape: Optional[int] = None):
+        env_shape, env_style, prefer_blink = self._read_env_prefs()
+        self._shape = self._resolve_shape(shape, env_shape)
+        self._style_code = self._style_code_for(env_style, prefer_blink)
         self._style_last = None  # last applied DECSCUSR code
         self._want: Tuple[int, Optional[int], Optional[int]] = (0, None, None)
         self._last: tuple[int, int, int] = (0, -1, -1)
@@ -76,36 +114,13 @@ class CursorController:
         try:
             vis, y, x = self._want
             last_vis, last_y, last_x = self._last
-            # Always align curses' internal cursor position when visible
             if vis > 0 and y is not None and x is not None:
-                # Ensure thin style before showing
                 self._apply_style()
-                # Only toggle visibility if it changed (avoid flicker)
                 if vis != last_vis:
-                    try:
-                        curses.curs_set(2 if vis >= 2 else 1)
-                    except Exception:
-                        # Fallback: show cursor via DEC private mode
-                        try:
-                            sys.stdout.write("\x1b[?25h")
-                            sys.stdout.flush()
-                        except Exception:
-                            pass
-                # Always move to keep curses internal (y, x) in sync
-                try:
-                    stdscr.move(int(y), int(x))
-                except Exception:
-                    pass
-            else:
-                if last_vis != 0:
-                    try:
-                        curses.curs_set(0)
-                    except Exception:
-                        try:
-                            sys.stdout.write("\x1b[?25l")
-                            sys.stdout.flush()
-                        except Exception:
-                            pass
+                    self._show_cursor(vis)
+                self._move_cursor(stdscr, int(y), int(x))
+            elif last_vis != 0:
+                self._hide_cursor()
             self._last = (vis, y if y is not None else -1, x if x is not None else -1)
         except Exception:
             pass

@@ -75,27 +75,51 @@ class SuggestionResult:
     end: int
 
 
-def compute_suggestions(text: str, caret: int, cwd: Optional[Union[str, Path]] = None, limit: int = 10) -> Optional[SuggestionResult]:
-    text = text or ''
-    caret = max(0, min(len(text), int(caret)))
-    # Slash commands at first token
-    if text.startswith('/'):
-        # From 0 up to first space or caret
-        end = text.find(' ')
-        if end == -1 or caret <= end:
-            end = caret if end == -1 else max(caret, end)
-            items = slash_suggest(text[:end] or '/', limit=limit)
-            if items:
-                return SuggestionResult(kind='slash', items=items, start=0, end=end)
-    # File token around caret by whitespace split
+def _slash_suggestions(text: str, caret: int, limit: int) -> Optional[SuggestionResult]:
+    if not text.startswith('/'):
+        return None
+    end = text.find(' ')
+    if end == -1 or caret <= end:
+        end = caret if end == -1 else max(caret, end)
+        items = slash_suggest(text[:end] or '/', limit=limit)
+        if items:
+            return SuggestionResult(kind='slash', items=items, start=0, end=end)
+    return None
+
+
+def _token_span(text: str, caret: int) -> tuple[int, int]:
     a = text.rfind(' ', 0, caret)
     a2 = text.rfind('\n', 0, caret)
     a = max(a, a2) + 1
     b = caret
     while b < len(text) and not text[b].isspace():
         b += 1
+    return a, b
+
+
+def _looks_like_file_token(token: str) -> bool:
+    return bool(
+        token
+        and (
+            token.startswith('/')
+            or token.startswith('~')
+            or token.startswith('./')
+            or token.startswith('../')
+            or ('/' in token)
+            or ('\\' in token)
+        )
+    )
+
+
+def compute_suggestions(text: str, caret: int, cwd: Optional[Union[str, Path]] = None, limit: int = 10) -> Optional[SuggestionResult]:
+    text = text or ''
+    caret = max(0, min(len(text), int(caret)))
+    slash = _slash_suggestions(text, caret, limit)
+    if slash is not None:
+        return slash
+    a, b = _token_span(text, caret)
     token = text[a:b]
-    if token and (token.startswith('/') or token.startswith('~') or token.startswith('./') or token.startswith('../') or ('/' in token) or ('\\' in token)):
+    if _looks_like_file_token(token):
         items = get_file_system_suggestions(token, cwd=cwd or Path('.').resolve(), limit=limit)
         if items:
             return SuggestionResult(kind='file', items=items, start=a, end=b)
@@ -179,6 +203,24 @@ __all__ += ['classify_peer', 'should_trigger_auth_hotkey', 'file_offer_target']
 
 
 # ===== File send policy (client-side pre-checks) =====
+def _combined_blocks(blocked: Optional[set[str]], blocked_by: Optional[set[str]]) -> set[str]:
+    return set(blocked or set()) | set(blocked_by or set())
+
+
+def _combined_friends(friends: Optional[dict[str, bool]], roster_friends: Optional[dict[str, dict]]) -> set[str]:
+    return set((friends or {}).keys()) | set((roster_friends or {}).keys())
+
+
+def _can_send_direct(sel: object, *, blocked: Optional[set[str]], blocked_by: Optional[set[str]], friends: Optional[dict[str, bool]], roster_friends: Optional[dict[str, dict]]) -> tuple[bool, str]:
+    bset = _combined_blocks(blocked, blocked_by)
+    if isinstance(sel, str) and (sel in bset):
+        return False, 'blocked'
+    fset = _combined_friends(friends, roster_friends)
+    if isinstance(sel, str) and (sel not in fset):
+        return False, 'not_friends'
+    return True, 'ok'
+
+
 def can_send_file(
     authed: bool,
     sel: object,
@@ -204,14 +246,7 @@ def can_send_file(
         return True, 'ok'
     if cls != 'user':
         return False, 'invalid_target'
-    # Direct user: check blocks and friendship
-    bset = set(blocked or set()) | set(blocked_by or set())
-    if isinstance(sel, str) and (sel in bset):
-        return False, 'blocked'
-    fset = set((friends or {}).keys()) | set((roster_friends or {}).keys())
-    if isinstance(sel, str) and (sel not in fset):
-        return False, 'not_friends'
-    return True, 'ok'
+    return _can_send_direct(sel, blocked=blocked, blocked_by=blocked_by, friends=friends, roster_friends=roster_friends)
 
 
 __all__ += ['can_send_file']

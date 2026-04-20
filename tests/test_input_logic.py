@@ -9,6 +9,7 @@ from modules.input_logic import (
     compute_suggestions,
     file_offer_target,
     handle_history_navigation,
+    normalize_function_key_escape,
     should_trigger_auth_hotkey,
 )
 
@@ -66,7 +67,17 @@ class TestInputLogic(unittest.TestCase):
             r = compute_suggestions("./he", caret=4, cwd=p, limit=10)
             self.assertTrue(r is None or r.kind in ("file", "slash"))
 
+    def test_normalize_function_key_escape(self):
+        self.assertEqual(normalize_function_key_escape("\x1bOP"), "F1")
+        self.assertEqual(normalize_function_key_escape("\x1bOS"), "F4")
+        self.assertEqual(normalize_function_key_escape("\x1b[11~"), "F1")
+        self.assertEqual(normalize_function_key_escape("\x1b[18~"), "F7")
+        self.assertEqual(normalize_function_key_escape("[18;2~"), "F7")
+        self.assertEqual(normalize_function_key_escape("\x1b[1;2P"), "F1")
+        self.assertEqual(normalize_function_key_escape("15~"), "F5")
+        self.assertEqual(normalize_function_key_escape("24~"), "F12")
+        self.assertIsNone(normalize_function_key_escape("\x1b[A"))
+
 
 if __name__ == "__main__":
     unittest.main()
-

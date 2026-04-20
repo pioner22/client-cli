@@ -35,6 +35,9 @@ class T:
     # Session / handshake
     WELCOME = "welcome"
     SESSION_REPLACED = "session_replaced"
+    SESSIONS_LIST = "sessions_list"
+    SESSIONS_LOGOUT_OTHERS = "sessions_logout_others"
+    SESSIONS_LOGOUT_OTHERS_RESULT = "sessions_logout_others_result"
 
     # Auth / register
     AUTH = "auth"
@@ -185,6 +188,7 @@ class T:
     FILE_ERROR = "file_error"                # any-side error
     FILE_ACCEPT_NOTICE = "file_accept_notice"  # server -> sender: recipient accepted
     FILE_RECEIVED = "file_received"            # server -> sender: recipient finished download
+    FILE_DOWNLOADED = "file_downloaded"        # client -> server: recipient finished HTTP download
     FILE_GET = "file_get"                      # request (re)download: {file_id}
     FILE_PREVIEW_READY = "file_preview_ready"  # server -> users: thumb/meta ready (clients should re-fetch file_url)
 

@@ -250,3 +250,88 @@ def can_send_file(
 
 
 __all__ += ['can_send_file']
+
+
+_FUNCTION_KEY_CSI_MAP = {
+    "11": "F1",
+    "12": "F2",
+    "13": "F3",
+    "14": "F4",
+    "15": "F5",
+    "17": "F6",
+    "18": "F7",
+    "19": "F8",
+    "20": "F9",
+    "21": "F10",
+    "24": "F12",
+    "23": "F11",
+}
+_FUNCTION_KEY_SS3_MAP = {
+    "OP": "F1",
+    "OQ": "F2",
+    "OR": "F3",
+    "OS": "F4",
+}
+
+
+def _normalize_escape_sequence(raw: object) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    seq = raw.strip()
+    if not seq:
+        return None
+    if seq.startswith("\x1b"):
+        seq = seq[1:]
+    return seq or None
+
+
+def _decode_ss3_function_key(seq: str) -> Optional[str]:
+    if seq in _FUNCTION_KEY_SS3_MAP:
+        return _FUNCTION_KEY_SS3_MAP[seq]
+    if seq.startswith("O") and seq[:2] in _FUNCTION_KEY_SS3_MAP and not seq[2:].strip():
+        return _FUNCTION_KEY_SS3_MAP[seq[:2]]
+    return None
+
+
+def _strip_csi_prefix(seq: str) -> str:
+    if seq.startswith("["):
+        return seq[1:]
+    return seq
+
+
+def _decode_csi_suffix_function_key(seq: str) -> Optional[str]:
+    if not seq or seq[-1] not in "PQRS":
+        return None
+    code = seq[:-1].split(";", 1)[0].strip()
+    if code not in ("", "1"):
+        return None
+    return _FUNCTION_KEY_SS3_MAP.get(f"O{seq[-1]}")
+
+
+def _decode_tilde_function_key(seq: str) -> Optional[str]:
+    if not seq.endswith("~"):
+        return None
+    code = seq[:-1].split(";", 1)[0].strip()
+    if not code:
+        return None
+    return _FUNCTION_KEY_CSI_MAP.get(code)
+
+
+def normalize_function_key_escape(raw: object) -> Optional[str]:
+    """Map CSI-style terminal escapes to a symbolic function key name."""
+    seq = _normalize_escape_sequence(raw)
+    if seq is None:
+        return None
+    direct = _decode_ss3_function_key(seq)
+    if direct is not None:
+        return direct
+    seq = _strip_csi_prefix(seq)
+    if not seq:
+        return None
+    csi = _decode_csi_suffix_function_key(seq)
+    if csi is not None:
+        return csi
+    return _decode_tilde_function_key(seq)
+
+
+__all__ += ['normalize_function_key_escape']

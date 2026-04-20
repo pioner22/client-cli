@@ -6,8 +6,11 @@
 
 __all__ = [
     "profile",
+    "profile_runtime",
     "authorization",
     "contacts",
     "status",
     "chat_input",
+    "runtime_env",
+    "file_contracts",
 ]

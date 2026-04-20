@@ -13,6 +13,7 @@ dependencies on curses/UI and can be imported by both client and server.
 """
 
 import base64
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -96,6 +97,73 @@ def _find_last_regex_hit(pattern: re.Pattern[str], text: str) -> Optional[str]:
     return _sanitize_path_candidate(hits[-1])
 
 
+def _extract_file_command_payload(text: str) -> Optional[str]:
+    s = (text or "").strip()
+    if not s:
+        return None
+    head, sep, rest = s.partition(" ")
+    if head != "/file" or not sep:
+        return None
+    payload = rest.strip()
+    return payload or None
+
+
+def _decode_exact_json_string(payload: str) -> Optional[str]:
+    if not payload.startswith('"'):
+        return None
+    try:
+        parsed, end = json.JSONDecoder().raw_decode(payload)
+    except Exception:
+        return None
+    if not isinstance(parsed, str) or payload[end:].strip():
+        return None
+    return _sanitize_path_candidate(parsed)
+
+
+def _decode_exact_single_quoted_string(payload: str) -> Optional[str]:
+    if len(payload) < 2 or payload[0] != "'" or payload[-1] != "'":
+        return None
+    return _sanitize_path_candidate(payload[1:-1])
+
+
+def _find_embedded_path(text: str) -> Optional[str]:
+    for pattern in (_ABS_PATH_RE, _REL_PATH_RE, _NAME_PATH_RE, _GENERAL_PATH_RE):
+        hit = _find_last_regex_hit(pattern, text)
+        if hit:
+            return hit
+    return None
+
+
+def _find_path_like_token(text: str) -> Optional[str]:
+    parts = [p for p in text.replace('\n', ' ').split(' ') if p]
+    for tok in reversed(parts):
+        if is_path_like(tok):
+            return _sanitize_path_candidate(tok)
+    return None
+
+
+def extract_file_command_path(text: str) -> Optional[str]:
+    """Extract the path payload from a dedicated ``/file`` command."""
+    payload = _extract_file_command_payload(text)
+    if payload is None:
+        return None
+    for parser in (_decode_exact_json_string, _decode_exact_single_quoted_string):
+        parsed = parser(payload)
+        if parsed is not None:
+            return parsed
+    return _sanitize_path_candidate(payload)
+
+
+def format_file_command(path: Union[str, os.PathLike[str]]) -> str:
+    """Return a ``/file`` command that safely round-trips paths with spaces."""
+    raw = str(path or "")
+    if not raw:
+        return "/file"
+    if any(ch.isspace() for ch in raw) or '"' in raw:
+        return f"/file {json.dumps(raw, ensure_ascii=False)}"
+    return f"/file {raw}"
+
+
 def extract_path_candidate(text: str) -> Optional[str]:
     """Extract a plausible filesystem path from a text message.
 
@@ -108,35 +176,22 @@ def extract_path_candidate(text: str) -> Optional[str]:
     if not s:
         return None
 
+    cmd_path = extract_file_command_path(s)
+    if cmd_path:
+        return cmd_path
+
     # 1) Прямая передача: вся строка — это путь
     if is_path_like(s):
         return _sanitize_path_candidate(s)
     # 2) Поиск абсолютных/относительных путей внутри текста (последний)
     #    - Unix/Posix: /..., ./..., ../...
     #    - Windows: C:\..., \\server\share\...
-    # Учитываем кавычки и скобки в качестве разделителей вокруг пути
-    hit = _find_last_regex_hit(_ABS_PATH_RE, s)
+    #    Учитываем кавычки и скобки в качестве разделителей вокруг пути
+    hit = _find_embedded_path(s)
     if hit:
         return hit
-    # Относительные пути с каталогами
-    hit = _find_last_regex_hit(_REL_PATH_RE, s)
-    if hit:
-        return hit
-    # 3) Имя файла в скобках/тексте (без каталогов), если похоже на файл по расширению
-    hit = _find_last_regex_hit(_NAME_PATH_RE, s)
-    if hit:
-        return hit
-    # 4) Общий абсолютный/UNC путь без требования расширения (последний)
-    #    Пример: /Users/user/file (с любым допустимым именем), C:\\path\\to\\file
-    hit = _find_last_regex_hit(_GENERAL_PATH_RE, s)
-    if hit:
-        return hit
-    # 5) Fallback: последний токен как путь, если выглядит как путь
-    parts = [p for p in s.replace('\n', ' ').split(' ') if p]
-    for tok in reversed(parts):
-        if is_path_like(tok):
-            return _sanitize_path_candidate(tok)
-    return None
+    # 3) Fallback: последний токен как путь, если выглядит как путь
+    return _find_path_like_token(s)
 
 
 def file_meta_for(path: Union[str, os.PathLike[str]]) -> Optional[FileMeta]:
@@ -229,7 +284,9 @@ __all__ = [
     'DEFAULT_CHUNK_SIZE',
     'FileMeta',
     'is_path_like',
+    'extract_file_command_path',
     'extract_path_candidate',
+    'format_file_command',
     'file_meta_for',
     'sanitize_remote_filename',
     'iter_base64_chunks',

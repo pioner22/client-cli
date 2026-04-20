@@ -13,6 +13,36 @@
         "last_login_at"
       ]
     },
+    "friendships": {
+      "columns": [
+        "user_id",
+        "friend_id"
+      ]
+    },
+    "pending_requests": {
+      "columns": [
+        "user_id",
+        "requester_id"
+      ]
+    },
+    "sessions": {
+      "columns": [
+        "user_id",
+        "token_hash",
+        "issued_at",
+        "last_used_at",
+        "expires_at"
+      ]
+    },
+    "presence": {
+      "columns": [
+        "user_id",
+        "is_online",
+        "session_started_at",
+        "last_seen_at",
+        "total_online_seconds"
+      ]
+    },
     "boards": {
       "columns": [
         "id",
@@ -69,36 +99,6 @@
         "created_at"
       ]
     },
-    "friendships": {
-      "columns": [
-        "user_id",
-        "friend_id"
-      ]
-    },
-    "pending_requests": {
-      "columns": [
-        "user_id",
-        "requester_id"
-      ]
-    },
-    "presence": {
-      "columns": [
-        "user_id",
-        "is_online",
-        "session_started_at",
-        "last_seen_at",
-        "total_online_seconds"
-      ]
-    },
-    "sessions": {
-      "columns": [
-        "user_id",
-        "token_hash",
-        "issued_at",
-        "last_used_at",
-        "expires_at"
-      ]
-    },
     "messages": {
       "columns": [
         "id",
@@ -135,6 +135,21 @@
         "created_at"
       ]
     },
+    "web_push_subscriptions": {
+      "columns": [
+        "id",
+        "user_id",
+        "endpoint_hash",
+        "endpoint",
+        "p256dh",
+        "auth",
+        "expiration_time",
+        "user_agent",
+        "client_kind",
+        "created_at",
+        "updated_at"
+      ]
+    },
     "file_offers": {
       "columns": [
         "fid",
@@ -163,19 +178,52 @@
         "updated_at"
       ]
     },
-    "web_push_subscriptions": {
+    "file_archive": {
+      "columns": [
+        "fid",
+        "msg_id",
+        "meta_json",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "call_runtime": {
+      "columns": [
+        "call_id",
+        "status",
+        "caller_id",
+        "peer_id",
+        "room_id",
+        "payload_json",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "call_pending_invites": {
+      "columns": [
+        "user_id",
+        "call_id",
+        "created_at"
+      ]
+    },
+    "call_notifications": {
       "columns": [
         "id",
         "user_id",
-        "endpoint_hash",
-        "endpoint",
-        "p256dh",
-        "auth",
-        "expiration_time",
-        "user_agent",
-        "client_kind",
-        "created_at",
-        "updated_at"
+        "call_id",
+        "payload_json",
+        "created_at"
+      ]
+    },
+    "shared_rate_limits": {
+      "columns": [
+        "subject_kind",
+        "subject_id",
+        "action",
+        "bucket_start",
+        "window_seconds",
+        "hits",
+        "expires_at"
       ]
     }
   }

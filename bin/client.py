@@ -42,6 +42,45 @@ def _dbg(msg: str) -> None:
         except Exception:
             pass
 
+def _write_term_bytes_to_tty(buf: bytes) -> bool:
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY | getattr(os, "O_NOCTTY", 0))
+        try:
+            os.write(fd, buf)
+        finally:
+            os.close(fd)
+    except Exception:
+        return False
+    return True
+
+
+def _write_term_bytes_to_stream(stream, buf: bytes) -> bool:
+    try:
+        if hasattr(stream, "buffer"):
+            stream.buffer.write(buf)  # type: ignore[attr-defined]
+        else:
+            stream.write(buf.decode("utf-8", "ignore"))
+        stream.flush()
+    except Exception:
+        return False
+    return True
+
+
+def _write_term_bytes(buf: bytes) -> None:
+    if _write_term_bytes_to_tty(buf):
+        return
+    if _write_term_bytes_to_stream(sys.stdout, buf):
+        return
+    fallback = getattr(sys, "__stdout__", None)
+    if fallback is not None:
+        _write_term_bytes_to_stream(fallback, buf)
+
+
+def _tmux_passthrough_bytes(seq: str) -> bytes:
+    payload = seq.replace("\x1b", "\x1b\x1b").encode("utf-8", "ignore")
+    return b"\x1bPtmux;" + payload + b"\x1b\\"
+
+
 def _term_write(seq: str, *, tmux_passthrough: bool = False) -> None:
     """Write a raw terminal control sequence.
 
@@ -49,47 +88,12 @@ def _term_write(seq: str, *, tmux_passthrough: bool = False) -> None:
     tmux_passthrough=True we also emit a DCS passthrough so the outer terminal
     receives the sequence.
     """
-    def _write_bytes(buf: bytes) -> None:
-        # Prefer /dev/tty so control sequences reach the controlling terminal even
-        # if stdout is wrapped (script/pty) or buffered.
-        try:
-            fd = os.open("/dev/tty", os.O_WRONLY | getattr(os, "O_NOCTTY", 0))
-            try:
-                os.write(fd, buf)
-            finally:
-                os.close(fd)
-            return
-        except Exception:
-            pass
-        try:
-            out = sys.stdout
-            if hasattr(out, "buffer"):
-                out.buffer.write(buf)  # type: ignore[attr-defined]
-                out.flush()
-                return
-        except Exception:
-            pass
-        try:
-            out = getattr(sys, "__stdout__", None)
-            if out is not None:
-                if hasattr(out, "buffer"):
-                    out.buffer.write(buf)  # type: ignore[attr-defined]
-                else:
-                    out.write(buf.decode("utf-8", "ignore"))
-                out.flush()
-        except Exception:
-            pass
-
-    try:
-        if not seq:
-            return
-        b = seq.encode("utf-8", "ignore")
-        _write_bytes(b)
-        if tmux_passthrough and os.environ.get('TMUX'):
-            payload = seq.replace("\x1b", "\x1b\x1b").encode("utf-8", "ignore")
-            _write_bytes(b"\x1bPtmux;" + payload + b"\x1b\\")
-    except Exception:
-        pass
+    if not seq:
+        return
+    buf = seq.encode("utf-8", "ignore")
+    _write_term_bytes(buf)
+    if tmux_passthrough and os.environ.get('TMUX'):
+        _write_term_bytes(_tmux_passthrough_bytes(seq))
 
 # Best-effort marker so F12 debug can show whether we attempted to arm mouse tracking.
 __MOUSE_ARMED__ = False
@@ -217,49 +221,8 @@ except Exception:
 APPLE_MOUSE_HANDLER: Optional[Callable] = None
 APPLE_MOUSE_AVAILABLE: Optional[bool] = None
 
-# Formatting helpers (graceful fallback if module not available)
-try:
-    from modules.formatting import apply_format as apply_text_format  # type: ignore
-except Exception:
-    def _word_bounds_fb(text: str, sel_start: int, sel_end: int, caret: int):
-        if sel_start != sel_end:
-            a, b = sorted((sel_start, sel_end))
-            return a, b
-        n = len(text)
-        caret = max(0, min(n, caret))
-        l = caret
-        while l > 0 and not text[l - 1].isspace():
-            l -= 1
-        r = caret
-        while r < n and not text[r].isspace():
-            r += 1
-        if l == r:
-            return 0, n
-        return l, r
-
-    def apply_text_format(kind: str, text: str, caret: int, sel_start: int, sel_end: int, link_text: str = "", link_url: str = ""):
-        text = text or ""
-        a, b = _word_bounds_fb(text, sel_start, sel_end, caret)
-        segment = text[a:b]
-        if kind == "bold":
-            formatted = f"**{segment or 'текст'}**"
-        elif kind == "link":
-            t = (link_text or segment or link_url or "").strip()
-            u = (link_url or "").strip()
-            if not t and segment:
-                t = segment
-            if not t and u:
-                t = u
-            formatted = f"[{t or 'link'}]({u})" if u else t
-        elif kind == "upper":
-            formatted = (segment or text).upper()
-        elif kind == "lower":
-            formatted = (segment or text).lower()
-        else:
-            formatted = segment
-        new_text = text[:a] + formatted + text[b:]
-        new_caret = a + len(formatted)
-        return type("FmtRes", (), {"text": new_text, "caret": new_caret})
+# Formatting helpers are shipped as part of the packaged runtime modules.
+from modules.formatting import apply_format as apply_text_format  # type: ignore
 
 # Toolbar actions: (key,label,kind)
 FORMAT_ACTIONS = [
@@ -399,146 +362,7 @@ except Exception:
         setattr(T, _name, _value)
     del _name, _value, _TFALLBACK_VALUES
 
-# Contact label fitting / display-width utilities (shared); fallback to local copy if unavailable
-try:
-    from modules.ui_utils import display_width, fit_contact_label, pad_to_width, right_truncate_to_width  # type: ignore
-except Exception:
-    _ZERO_WIDTH = {
-        "\u200b",  # ZERO WIDTH SPACE
-        "\u200c",  # ZERO WIDTH NON-JOINER
-        "\u200d",  # ZERO WIDTH JOINER
-        "\u200e",  # LEFT-TO-RIGHT MARK
-        "\u200f",  # RIGHT-TO-LEFT MARK
-        "\ufeff",  # ZERO WIDTH NO-BREAK SPACE (BOM)
-        "\ufe0e",  # VARIATION SELECTOR-15
-        "\ufe0f",  # VARIATION SELECTOR-16
-    }
-
-    def _is_zero_width(ch: str) -> bool:
-        if ch in _ZERO_WIDTH:
-            return True
-        try:
-            return unicodedata.category(ch) == "Cf"
-        except Exception:
-            return False
-
-    def _wcwidth(ch: str) -> int:
-        try:
-            if _is_zero_width(ch) or unicodedata.combining(ch):
-                return 0
-        except Exception:
-            pass
-        try:
-            fn = _WCWIDTH_FUNC
-            if fn is not None:
-                w = fn(ch)
-                if w is not None and w >= 0:
-                    return int(w)
-        except Exception:
-            pass
-        try:
-            if unicodedata.east_asian_width(ch) in ("W", "F"):
-                return 2
-        except Exception:
-            pass
-        return 1
-
-    def _load_wcwidth_func():
-        try:
-            import wcwidth as _wc  # type: ignore
-
-            return getattr(_wc, "wcwidth", None)
-        except Exception:
-            return None
-
-    _WCWIDTH_FUNC = _load_wcwidth_func()
-
-    @functools.lru_cache(maxsize=4096)
-    def _wcwidth_cached(ch: str) -> int:
-        return _wcwidth(ch)
-
-    def display_width(s: str) -> int:
-        try:
-            return sum(_wcwidth_cached(ch) for ch in (s or ""))
-        except Exception:
-            return len(s or "")
-
-    def _truncate_to_width(s: str, width: int) -> str:
-        if width <= 0:
-            return ""
-        out: List[str] = []
-        cols = 0
-        for ch in (s or ""):
-            try:
-                if _is_zero_width(ch) or unicodedata.combining(ch):
-                    if out:
-                        out.append(ch)
-                    continue
-            except Exception:
-                pass
-            w = max(0, _wcwidth_cached(ch))
-            if cols + w > width:
-                break
-            out.append(ch)
-            cols += w
-        return "".join(out)
-
-    def _right_truncate_to_width(s: str, width: int) -> str:
-        if width <= 0:
-            return ""
-        out_rev: List[str] = []
-        cols = 0
-        pending: List[str] = []
-        for ch in reversed(s or ""):
-            try:
-                if _is_zero_width(ch) or unicodedata.combining(ch):
-                    pending.append(ch)
-                    continue
-            except Exception:
-                pass
-            w = max(0, _wcwidth_cached(ch))
-            if cols + w > width:
-                break
-            seg = ch + "".join(reversed(pending))
-            pending.clear()
-            out_rev.append(seg)
-            cols += w
-        out_rev.reverse()
-        return "".join(out_rev)
-
-    # Public alias for code that expects the shared helper name.
-    right_truncate_to_width = _right_truncate_to_width
-
-    def pad_to_width(s: str, width: int) -> str:
-        if width <= 0:
-            return ""
-        trimmed = _truncate_to_width(s, width)
-        cur = display_width(trimmed)
-        if cur >= width:
-            return trimmed
-        return trimmed + (" " * (width - cur))
-
-    def fit_contact_label(s: str, width: int) -> str:
-        try:
-            if width <= 0:
-                return ""
-            if display_width(s) <= width:
-                return s
-            if width == 1:
-                return "…"
-            idx = s.rfind(" [")
-            if idx != -1 and s.endswith("]"):
-                suffix = s[idx:]
-                if display_width(suffix) >= max(4, width):
-                    return _truncate_to_width(s, max(0, width - 1)) + "…"
-                avail = width - display_width(suffix) - 1
-                if avail <= 0:
-                    return "…" + _right_truncate_to_width(suffix, max(0, width - 1))
-                prefix = s[:idx].rstrip()
-                return _truncate_to_width(prefix, avail) + "…" + suffix
-            return _truncate_to_width(s, max(0, width - 1)) + "…"
-        except Exception:
-            return s[:width]
+from modules.ui_utils import display_width, fit_contact_label, pad_to_width, right_truncate_to_width  # type: ignore
 PROFILE_MODULE_FALLBACK = False
 try:
     from modules.profile import make_profile_set_payload, normalize_handle  # type: ignore
@@ -594,54 +418,7 @@ except Exception:
             payload['handle'] = nh
         return payload
 
-# Cursor controller (external module with fallback)
-CURSOR_MODULE_FALLBACK = False
-try:
-    from modules.cursor import CursorController  # type: ignore
-except Exception:
-    CURSOR_MODULE_FALLBACK = True
-    class CursorController:  # fallback minimal controller
-        def __init__(self, shape: int = 2):
-            self._want = (0, None, None)  # vis, y, x
-            self._last = (0, -1, -1)
-            self._shape = 2 if shape not in (0, 1) else shape
-
-        def begin(self, stdscr):
-            try:
-                curses.curs_set(0)
-            except Exception:
-                pass
-            self._want = (0, None, None)
-
-        def want(self, y: int, x: int, vis: int = 1):
-            try:
-                self._want = (max(0, int(vis)), int(y), int(x))
-            except Exception:
-                self._want = (0, None, None)
-
-        def apply(self, stdscr):
-            try:
-                vis, y, x = self._want
-                last_vis, last_y, last_x = self._last
-                if (vis, y, x) != (last_vis, last_y, last_x):
-                    if vis > 0 and y is not None and x is not None:
-                        try:
-                            curses.curs_set(2 if vis >= 2 else 1)
-                        except Exception:
-                            pass
-                        try:
-                            stdscr.move(int(y), int(x))
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            curses.curs_set(0)
-                        except Exception:
-                            pass
-                    self._last = (vis, y if y is not None else -1, x if x is not None else -1)
-            except Exception:
-                pass
-
+from modules.cursor import CursorController  # type: ignore
 CURSOR = CursorController()
 
 # Optional import for status icons
@@ -989,103 +766,14 @@ class _ChatInputProxy:
 
 chat_input = _ChatInputProxy()  # type: ignore
 
-# File transfer helpers (shared module with safe fallbacks)
-FILE_TRANSFER_FALLBACK = False
+# File transfer helpers ship as part of the packaged runtime modules.
+from modules.file_transfer import extract_path_candidate, file_meta_for, format_file_command, iter_base64_chunks, DEFAULT_CHUNK_SIZE, progress_percent, sanitize_remote_filename  # type: ignore
+
 try:
-    from modules.file_transfer import extract_path_candidate, file_meta_for, iter_base64_chunks, DEFAULT_CHUNK_SIZE, progress_percent, sanitize_remote_filename  # type: ignore
+    from modules.input_logic import normalize_function_key_escape  # type: ignore
 except Exception:
-    FILE_TRANSFER_FALLBACK = True
-    # Precompiled regexes for fallback to avoid per-call compilation
-    _FT_TRAIL_CHARS = set(list('.,;:!?✓…') + [')', ']', '}', '»', '”', '’'])
-    _FT_ABS_PAT = re.compile(r'''(?:^|\s|[\[\(\{"'«»“”„])((?:[A-Za-z]:)?[/\\][^\s\]\)"'«»“”„]+?\.(?:[A-Za-z0-9]{1,6}))''')
-    _FT_REL_PAT = re.compile(r'''(?:^|\s|[\[\(\{"'«»“”„])((?:\./|\.\./)?(?:[A-Za-z0-9._-]+[/\\])+[A-Za-z0-9._-]+\.(?:[A-Za-z0-9]{1,6}))''')
-    _FT_NAME_PAT = re.compile(r"([A-Za-z0-9._-]+\.(?:png|jpe?g|gif|webp|bmp|pdf|txt|zip|tar|gz|7z|mp4|mov|mkv))", re.IGNORECASE)
-    _FT_GENERAL_PAT = re.compile(r'''(?:^|\s|[\[\(\{"'«»“”„])((?:[A-Za-z]:)?[/\\][^\s\]\)"'«»“”„]+)''')
-    def sanitize_remote_filename(name: str, *, default: str = "file") -> str:
-        try:
-            s = str(name or "")
-        except Exception:
-            s = ""
-        s = s.strip().replace("\\", "/").split("/")[-1].strip()
-        if not s or s in (".", ".."):
-            s = default
-        try:
-            s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
-        except Exception:
-            s = default
-        if not s or s in (".", ".."):
-            s = default
-        try:
-            max_len = 128
-            if len(s) > max_len:
-                root, ext = os.path.splitext(s)
-                ext = ext[:16]
-                s = (root[: max(1, max_len - len(ext))] + ext)[:max_len]
-        except Exception:
-            pass
-        return s
-    def extract_path_candidate(text: str) -> Optional[str]:
-        """Fallback extractor: reuse shared regexes to avoid heavy work per keystroke."""
-        if not text:
-            return None
-        s = (text or '').strip()
-        if not s:
-            return None
-        def _sanitize(p: str) -> str:
-            if not isinstance(p, str):
-                return p
-            t = p.strip()
-            if len(t) >= 2 and t[0] in "\"'«“„””" and t[-1] in "\"'»“„””":
-                t = t[1:-1].strip()
-            while len(t) > 1 and t[-1] in _FT_TRAIL_CHARS:
-                t = t[:-1]
-                t = t.strip()
-            return t
-        if (_FT_ABS_PAT.search(s) and _FT_ABS_PAT.findall(s)):
-            hits = _FT_ABS_PAT.findall(s)
-            if hits:
-                return _sanitize(hits[-1])
-        hits = _FT_REL_PAT.findall(s)
-        if hits:
-            return _sanitize(hits[-1])
-        hits = _FT_NAME_PAT.findall(s)
-        if hits:
-            return _sanitize(hits[-1])
-        hits = _FT_GENERAL_PAT.findall(s)
-        if hits:
-            return _sanitize(hits[-1])
-        parts = [p for p in s.replace('\n', ' ').split(' ') if p]
-        for tok in reversed(parts):
-            if (os.sep in tok) or tok.startswith('/') or tok.startswith('./') or tok.startswith('../'):
-                return _sanitize(tok)
+    def normalize_function_key_escape(raw):
         return None
-    def file_meta_for(path):
-        try:
-            p = Path(path).expanduser()
-            st = p.stat()
-            if not p.is_file():
-                return None
-            return type('FileMeta', (), {'path': p, 'name': p.name, 'size': int(st.st_size)})
-        except Exception:
-            return None
-    def iter_base64_chunks(p: Path, chunk_size: int = 32*1024):
-        import base64 as _b64
-        seq = 0
-        with open(p, 'rb') as f:
-            while True:
-                buf = f.read(max(1, int(chunk_size)))
-                if not buf:
-                    break
-                yield seq, _b64.b64encode(buf).decode('ascii')
-                seq += 1
-    DEFAULT_CHUNK_SIZE = 32 * 1024
-    def progress_percent(done: int, total: int) -> int:
-        try:
-            if total <= 0:
-                return 0
-            return max(0, min(100, int((max(0, done)/float(total))*100)))
-        except Exception:
-            return 0
 
 # Menu/modal helper (fallback if external module missing)
 MODALS_MODULE_FALLBACK = False
@@ -1149,7 +837,7 @@ except Exception:
     def get_file_system_suggestions(token: str, cwd=None, limit: int = 20):
         return []
 
-CLIENT_VERSION = "0.4.2106"
+CLIENT_VERSION = "0.4.2150"
 _VER_PART_RE = re.compile(r"\d+")
 
 
@@ -1303,35 +991,48 @@ def member_labels(ids: List[str], state, owner_id: Optional[str] = None) -> List
     return labels
 
 
+def _members_payload(data: dict, peer: str, *, title_prefix: str, request: dict) -> dict:
+    return {
+        "members": list(data.get('members') or []),
+        "owner_id": str(data.get('owner_id') or ''),
+        "name": str(data.get('name') or peer),
+        "title_prefix": title_prefix,
+        "request": request,
+    }
+
+
+def _members_view_payload(state, peer: str) -> Optional[dict]:
+    groups = getattr(state, 'groups', {}) or {}
+    if peer in groups:
+        return _members_payload(groups.get(peer) or {}, peer, title_prefix="Участники чата", request={"type": "group_info", "group_id": peer})
+    boards = getattr(state, 'boards', {}) or {}
+    if peer in boards:
+        return _members_payload(boards.get(peer) or {}, peer, title_prefix="Участники доски", request={"type": "board_info", "board_id": peer})
+    return None
+
+
+def _activate_members_view(state, peer: str, payload: dict) -> None:
+    state.members_view_mode = True
+    state.members_view_target = peer
+    state.members_view_entries = member_labels(payload["members"], state, owner_id=payload["owner_id"])
+    state.members_view_title = f"{payload['title_prefix']}: {payload['name']}"
+
+
+def _safe_net_send(net, payload: dict) -> None:
+    try:
+        net.send(payload)
+    except Exception:
+        pass
+
+
 def open_members_view(state, net, peer: str) -> None:
     """Open read-only members list for group/board."""
     try:
-        if peer in getattr(state, 'groups', {}):
-            g = state.groups.get(peer) or {}
-            members = list(g.get('members') or [])
-            owner_id = str(g.get('owner_id') or '')
-            state.members_view_mode = True
-            state.members_view_target = peer
-            state.members_view_entries = member_labels(members, state, owner_id=owner_id)
-            name = str(g.get('name') or peer)
-            state.members_view_title = f"Участники чата: {name}"
-            try:
-                net.send({"type": "group_info", "group_id": peer})
-            except Exception:
-                pass
-        elif peer in getattr(state, 'boards', {}):
-            b = (getattr(state, 'boards', {}) or {}).get(peer) or {}
-            members = list(b.get('members') or [])
-            owner_id = str(b.get('owner_id') or '')
-            state.members_view_mode = True
-            state.members_view_target = peer
-            state.members_view_entries = member_labels(members, state, owner_id=owner_id)
-            name = str(b.get('name') or peer)
-            state.members_view_title = f"Участники доски: {name}"
-            try:
-                net.send({"type": "board_info", "board_id": peer})
-            except Exception:
-                pass
+        payload = _members_view_payload(state, peer)
+        if not payload:
+            return
+        _activate_members_view(state, peer, payload)
+        _safe_net_send(net, payload["request"])
     except Exception:
         try:
             state.status = "Не удалось получить список участников"
@@ -1345,6 +1046,11 @@ DEFAULT_UPDATE_URL = "https://yagodka.org:17778"
 EXPECTED_ROOT_DIRS = {"bin", "modules", "config", "scripts", "var"}
 FORBIDDEN_ROOT_FILES = {"client.py", "bootstrap.py", "pubkey.txt", "schema.json", "version.json"}
 REQUIRED_VAR_SUBDIRS = {"files", "history", "log", "update", "users"}
+STRAY_RUNTIME_DIRS = (
+    Path("runtime"),
+    Path("var") / "runtime",
+    Path("modules 2"),
+)
 
 def _is_within_root(root: Path, target: Path) -> bool:
     """Return True if target (after resolving symlinks) stays within root."""
@@ -1380,50 +1086,107 @@ def ensure_storage_dirs() -> None:
         pass
 
 
+_GROUP_MEMBER_ID_RE = re.compile(r"^(?:\d{3}-\d{2}|\d{3}(?:-\d{3})+)$")
+
+
+def _nonempty_member_ids(member_ids: List[str]) -> List[str]:
+    try:
+        return [member for member in member_ids if member]
+    except Exception:
+        return []
+
+
+def _known_friend_ids(state) -> Set[str]:
+    try:
+        return set(getattr(state, 'friends', {}).keys()) | set(getattr(state, 'roster_friends', {}).keys())
+    except Exception:
+        return set()
+
+
+def _is_id_like_member_token(token: object) -> bool:
+    return isinstance(token, str) and bool(_GROUP_MEMBER_ID_RE.match(token)) and not token.startswith('@')
+
+
+def _set_group_creation_state(state, *, modal_message: str, status: str) -> None:
+    try:
+        state.modal_message = modal_message
+        state.status = status
+        state.group_create_mode = True
+        state.group_create_field = 1
+        state.group_verify_mode = False
+    except Exception:
+        pass
+
+
 def ensure_group_members_authorized(state, member_ids: List[str], net) -> bool:
     """Client-side precheck for group creation.
 
     - Require at least one participant
     - If известны друзья (roster), подскажем, что по умолчанию можно добавлять только друзей
     """
-    try:
-        valid = [m for m in member_ids if m]
-    except Exception:
-        valid = []
-    if valid:
-        # If we know friends roster and none of ids belong to friends, hint the policy early.
+    valid = _nonempty_member_ids(member_ids)
+    if not valid:
+        _set_group_creation_state(
+            state,
+            modal_message="Добавьте хотя бы одного участника",
+            status="Введите участников",
+        )
+        return False
+    friends_set = _known_friend_ids(state)
+    only_ids = [member for member in valid if _is_id_like_member_token(member)]
+    if friends_set and only_ids and not any(member in friends_set for member in only_ids):
+        _set_group_creation_state(
+            state,
+            modal_message="Добавьте хотя бы одного друга (по умолчанию — только друзья)",
+            status="Требуется друг в участниках",
+        )
+        return False
+    return True
+
+
+def _ensure_root_dirs(root: Path) -> bool:
+    ok = True
+    present_dirs = {item.name for item in root.iterdir() if item.is_dir()}
+    for name in EXPECTED_ROOT_DIRS:
+        if name in present_dirs:
+            continue
         try:
-            friends_set = set(getattr(state, 'friends', {}).keys()) | set(getattr(state, 'roster_friends', {}).keys())
+            (root / name).mkdir(parents=True, exist_ok=True)
         except Exception:
-            friends_set = set()
-        # Only check ID-like tokens here; handles are resolved elsewhere
-        def _id_like(tok: str) -> bool:
-            try:
-                import re as _re2
-                return bool(_re2.match(r"^(?:\d{3}-\d{2}|\d{3}(?:-\d{3})+)$", tok))
-            except Exception:
-                return False
-        only_ids = [m for m in valid if isinstance(m, str) and _id_like(m) and not m.startswith('@')]
-        if friends_set and only_ids and not any((m in friends_set) for m in only_ids):
-            try:
-                state.modal_message = "Добавьте хотя бы одного друга (по умолчанию — только друзья)"
-                state.status = "Требуется друг в участниках"
-                state.group_create_mode = True
-                state.group_create_field = 1
-                state.group_verify_mode = False
-            except Exception:
-                pass
-            return False
+            ok = False
+    return ok
+
+
+def _remove_forbidden_root_file(root: Path, filename: str) -> bool:
+    if filename == "client.py" and not (root / "bin" / "client.py").exists():
         return True
-    # Keep modal open and ask to add at least one participant
     try:
-        state.modal_message = "Добавьте хотя бы одного участника"
-        state.status = "Введите участников"
-        state.group_create_mode = True
-        state.group_create_field = 1
-        state.group_verify_mode = False
+        (root / filename).unlink()
+    except FileNotFoundError:
+        return True
     except Exception:
-        pass
+        return False
+    return True
+
+
+def _remove_stray_tree(path: Path) -> bool:
+    try:
+        if path.exists():
+            shutil.rmtree(path)
+    except Exception:
+        return False
+    return True
+
+
+def _ensure_var_dirs(root: Path) -> bool:
+    ok = True
+    var_dir = root / "var"
+    for name in REQUIRED_VAR_SUBDIRS:
+        try:
+            (var_dir / name).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            ok = False
+    return ok
 
 
 def _fix_structure() -> bool:
@@ -1436,37 +1199,12 @@ def _fix_structure() -> bool:
     try:
         if not root.exists():
             root.mkdir(parents=True, exist_ok=True)
-        present_dirs = {p.name for p in root.iterdir() if p.is_dir()}
-        for d in EXPECTED_ROOT_DIRS:
-            if d not in present_dirs:
-                try:
-                    (root / d).mkdir(parents=True, exist_ok=True)
-                except Exception:
-                    ok = False
+        ok = _ensure_root_dirs(root) and ok
         for fname in FORBIDDEN_ROOT_FILES:
-            # Разрешаем плоскую раскладку: если нет bin/client.py — не удаляем client.py в корне
-            if fname == "client.py" and not (root / "bin" / "client.py").exists():
-                continue
-            try:
-                (root / fname).unlink()
-            except FileNotFoundError:
-                pass
-            except Exception:
-                ok = False
-        # Remove stray runtime/modules duplicates
-        for stray in (root / "runtime", root / "var" / "runtime", root / "modules 2"):
-            try:
-                if stray.exists():
-                    import shutil
-                    shutil.rmtree(stray)
-            except Exception:
-                ok = False
-        var_dir = root / "var"
-        for sub in REQUIRED_VAR_SUBDIRS:
-            try:
-                (var_dir / sub).mkdir(parents=True, exist_ok=True)
-            except Exception:
-                ok = False
+            ok = _remove_forbidden_root_file(root, fname) and ok
+        for stray_rel in STRAY_RUNTIME_DIRS:
+            ok = _remove_stray_tree(root / stray_rel) and ok
+        ok = _ensure_var_dirs(root) and ok
     except Exception:
         ok = False
     return ok
@@ -1550,6 +1288,35 @@ def _fetch_url(url: str, timeout: float = 6.0) -> Optional[bytes]:
         return None
 
 
+def _decode_32byte_text_value(value: object) -> Optional[bytes]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    for loader in (bytes.fromhex, lambda item: base64.b64decode(item, validate=True)):
+        try:
+            data = loader(text)
+        except Exception:
+            continue
+        if len(data) == 32:
+            return data
+    return None
+
+
+def _pinned_update_pubkey() -> Optional[bytes]:
+    try:
+        cfg = _load_config_full()
+    except Exception:
+        return None
+    return _decode_32byte_text_value(cfg.get('update_pubkey'))
+
+
+def _embedded_update_pubkey() -> Optional[bytes]:
+    embedded = globals().get('EMBEDDED_UPDATE_PUBKEY_HEX')
+    return _decode_32byte_text_value(embedded)
+
+
 def _parse_pubkey_env() -> Optional[bytes]:
     """Get update public key from env, pinned config, or embedded default.
 
@@ -1558,55 +1325,13 @@ def _parse_pubkey_env() -> Optional[bytes]:
     2) pinned in client_config.json as 'update_pubkey'
     3) embedded constant EMBEDDED_UPDATE_PUBKEY_HEX (optional)
     """
-    # 1) env
-    try:
-        pk = os.environ.get('UPDATE_PUBKEY')
-        if pk:
-            s = pk.strip()
-            try:
-                b = bytes.fromhex(s)
-                if len(b) == 32:
-                    return b
-            except Exception:
-                pass
-            try:
-                b = base64.b64decode(s, validate=True)
-                if len(b) == 32:
-                    return b
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # 2) pinned in config
-    try:
-        cfg = _load_config_full()
-        txt = cfg.get('update_pubkey')
-        if isinstance(txt, str) and txt.strip():
-            s = txt.strip()
-            try:
-                b = bytes.fromhex(s)
-                if len(b) == 32:
-                    return b
-            except Exception:
-                pass
-            try:
-                b = base64.b64decode(s, validate=True)
-                if len(b) == 32:
-                    return b
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # 3) embedded
-    try:
-        EMBEDDED_UPDATE_PUBKEY_HEX = globals().get('EMBEDDED_UPDATE_PUBKEY_HEX')  # type: ignore
-        if isinstance(EMBEDDED_UPDATE_PUBKEY_HEX, str) and EMBEDDED_UPDATE_PUBKEY_HEX:
-            b = bytes.fromhex(EMBEDDED_UPDATE_PUBKEY_HEX.strip())
-            if len(b) == 32:
-                return b
-    except Exception:
-        pass
-    return None
+    env_pubkey = _decode_32byte_text_value(os.environ.get('UPDATE_PUBKEY'))
+    if env_pubkey is not None:
+        return env_pubkey
+    pinned_pubkey = _pinned_update_pubkey()
+    if pinned_pubkey is not None:
+        return pinned_pubkey
+    return _embedded_update_pubkey()
 
 def _store_pinned_pubkey(pub: bytes) -> bool:
     if _is_ephemeral():
@@ -1782,132 +1507,167 @@ def _hash_file(path: Path) -> Optional[str]:
         return None
 
 
+def _is_safe_release_member(member: tarfile.TarInfo) -> bool:
+    name = str(member.name or "")
+    norm = name.replace("\\", "/")
+    path = Path(norm)
+    return bool(norm) and not path.is_absolute() and ".." not in path.parts and (member.isfile() or member.isdir())
+
+
+def _safe_release_members(tf: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    return [member for member in tf.getmembers() if _is_safe_release_member(member)]
+
+
+def _extract_release_members(tf: tarfile.TarFile, tmpdir: Path, members: list[tarfile.TarInfo]) -> bool:
+    for member in members:
+        norm = str(member.name or "").replace("\\", "/")
+        out_path = tmpdir / norm
+        if not _is_within_root(tmpdir, out_path.parent):
+            return False
+        if member.isdir():
+            out_path.mkdir(parents=True, exist_ok=True)
+            continue
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        src = tf.extractfile(member)
+        if src is None:
+            continue
+        with src, open(out_path, "wb") as dst_f:
+            shutil.copyfileobj(src, dst_f)
+    return True
+
+
+def _release_base_dir(tmpdir: Path) -> Optional[Path]:
+    entries = list(tmpdir.iterdir())
+    if not entries:
+        return None
+    roots = {entry.relative_to(tmpdir).parts[0] for entry in entries}
+    if len(roots) != 1:
+        return tmpdir
+    candidate = tmpdir / next(iter(roots))
+    return candidate if candidate.is_dir() else tmpdir
+
+
+def _preserved_client_config(root: Path) -> tuple[Path, Path, Optional[bytes]]:
+    cfg_rel = Path("config/client_config.json")
+    cfg_path = root / cfg_rel
+    try:
+        if cfg_path.exists() and cfg_path.is_file():
+            return cfg_rel, cfg_path, cfg_path.read_bytes()
+    except Exception:
+        pass
+    return cfg_rel, cfg_path, None
+
+
+def _remove_existing_release_target(target: Path) -> bool:
+    if not target.exists():
+        return True
+    if target.is_symlink():
+        return False
+    try:
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=False)
+        else:
+            target.unlink(missing_ok=True)
+    except Exception:
+        return False
+    return True
+
+
+def _remove_managed_release_targets(root: Path, base: Path) -> bool:
+    try:
+        managed_top = {path.name for path in base.iterdir()}
+    except Exception:
+        return False
+    for name in sorted(managed_top):
+        if name == "var":
+            continue
+        if name == "config" and not (base / "config").exists():
+            continue
+        if not _remove_existing_release_target(root / name):
+            return False
+    return True
+
+
+def _install_release_file(source: Path, target: Path, root: Path) -> bool:
+    if not _is_within_root(root, target.parent):
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as out_f, open(source, "rb") as in_f:
+            shutil.copyfileobj(in_f, out_f)
+        try:
+            os.chmod(tmp_name, 0o755 if target.name.endswith(".py") else 0o644)
+        except Exception:
+            pass
+        os.replace(tmp_name, target)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        except Exception:
+            pass
+    return True
+
+
+def _install_release_tree(base: Path, root: Path, cfg_rel: Path, preserved_cfg: Optional[bytes]) -> bool:
+    for source in base.rglob("*"):
+        if source.is_dir():
+            continue
+        if source.is_symlink():
+            return False
+        rel = source.relative_to(base)
+        if rel.parts and rel.parts[0] == "var":
+            continue
+        if rel == cfg_rel and preserved_cfg is not None:
+            continue
+        if not _install_release_file(source, root / rel, root):
+            return False
+    return True
+
+
+def _restore_preserved_config(cfg_path: Path, preserved_cfg: Optional[bytes]) -> bool:
+    if preserved_cfg is None:
+        return True
+    try:
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_bytes(preserved_cfg)
+    except Exception:
+        return False
+    return True
+
+
+def _prepare_update_tmpdir(root: Path) -> Optional[Path]:
+    tmpdir = root / ".update_tmp_extract"
+    if tmpdir.exists():
+        if tmpdir.is_symlink() or not tmpdir.is_dir():
+            return None
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    return tmpdir
+
+
 def _extract_client_release(tar_path: Path, root: Path) -> bool:
     """Extract client-release.tar.gz into root while keeping local var/ and config."""
     try:
         root = root.resolve()
-        tmpdir = root / ".update_tmp_extract"
-        if tmpdir.exists():
-            # Refuse to operate on a symlink to avoid deleting/copying outside root.
-            if tmpdir.is_symlink() or not tmpdir.is_dir():
-                return False
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        tmpdir.mkdir(parents=True, exist_ok=True)
+        tmpdir = _prepare_update_tmpdir(root)
+        if tmpdir is None:
+            return False
         try:
             with tarfile.open(tar_path, "r:*") as tf:
-                safe_members: list[tarfile.TarInfo] = []
-                for m in tf.getmembers():
-                    name = str(m.name or "")
-                    norm = name.replace("\\", "/")
-                    p = Path(norm)
-                    if not norm or p.is_absolute() or ".." in p.parts:
-                        continue
-                    # Only allow regular files and directories; drop links/devices/etc.
-                    if not (m.isfile() or m.isdir()):
-                        continue
-                    safe_members.append(m)
-                if not safe_members:
+                safe_members = _safe_release_members(tf)
+                if not safe_members or not _extract_release_members(tf, tmpdir, safe_members):
                     return False
-                for m in safe_members:
-                    norm = str(m.name or "").replace("\\", "/")
-                    out_path = tmpdir / norm
-                    if not _is_within_root(tmpdir, out_path.parent):
-                        return False
-                    if m.isdir():
-                        out_path.mkdir(parents=True, exist_ok=True)
-                        continue
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    src = tf.extractfile(m)
-                    if src is None:
-                        continue
-                    with src:
-                        with open(out_path, "wb") as dst_f:
-                            shutil.copyfileobj(src, dst_f)
-            entries = list(tmpdir.iterdir())
-            if not entries:
+            base = _release_base_dir(tmpdir)
+            if base is None:
                 return False
-            roots = {p.relative_to(tmpdir).parts[0] for p in entries}
-            base = tmpdir
-            if len(roots) == 1:
-                candidate = tmpdir / next(iter(roots))
-                if candidate.is_dir():
-                    base = candidate
-            # Ensure extracted release fully replaces managed dirs to avoid stale/extra files.
-            preserved_cfg: Optional[bytes] = None
-            cfg_rel = Path("config/client_config.json")
-            cfg_path = root / cfg_rel
-            try:
-                if cfg_path.exists() and cfg_path.is_file():
-                    preserved_cfg = cfg_path.read_bytes()
-            except Exception:
-                preserved_cfg = None
-            try:
-                managed_top = {p.name for p in base.iterdir()}
-            except Exception:
-                managed_top = set()
-            for name in sorted(managed_top):
-                if name == "var":
-                    continue
-                if name == "config":
-                    if not (base / "config").exists():
-                        continue
-                    config_dir = root / "config"
-                    if config_dir.exists():
-                        if config_dir.is_symlink() or not config_dir.is_dir():
-                            return False
-                        try:
-                            shutil.rmtree(config_dir, ignore_errors=False)
-                        except Exception:
-                            return False
-                    continue
-                target = root / name
-                if not target.exists():
-                    continue
-                if target.is_symlink():
-                    return False
-                if target.is_dir():
-                    try:
-                        shutil.rmtree(target, ignore_errors=False)
-                    except Exception:
-                        return False
-                else:
-                    target.unlink(missing_ok=True)
-            for f in base.rglob("*"):
-                if f.is_dir():
-                    continue
-                if f.is_symlink():
-                    return False
-                rel = f.relative_to(base)
-                if rel.parts and rel.parts[0] == "var":
-                    continue
-                if rel == cfg_rel and preserved_cfg is not None:
-                    continue
-                target = root / rel
-                if not _is_within_root(root, target.parent):
-                    return False
-                target.parent.mkdir(parents=True, exist_ok=True)
-                fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
-                try:
-                    with os.fdopen(fd, "wb") as out_f, open(f, "rb") as in_f:
-                        shutil.copyfileobj(in_f, out_f)
-                    try:
-                        os.chmod(tmp_name, 0o755 if target.name.endswith(".py") else 0o644)
-                    except Exception:
-                        pass
-                    os.replace(tmp_name, target)
-                finally:
-                    try:
-                        if os.path.exists(tmp_name):
-                            os.unlink(tmp_name)
-                    except Exception:
-                        pass
-            if preserved_cfg is not None:
-                try:
-                    cfg_path.parent.mkdir(parents=True, exist_ok=True)
-                    cfg_path.write_bytes(preserved_cfg)
-                except Exception:
-                    return False
-            return True
+            cfg_rel, cfg_path, preserved_cfg = _preserved_client_config(root)
+            if not _remove_managed_release_targets(root, base):
+                return False
+            if not _install_release_tree(base, root, cfg_rel, preserved_cfg):
+                return False
+            return _restore_preserved_config(cfg_path, preserved_cfg)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
     except Exception:
@@ -1974,11 +1734,185 @@ def _manifest_root_hash(entries: list[dict]) -> str:
         return ""
 
 
-def _apply_manifest_update(manifest: dict, base_url: str, stdscr=None, forced: bool = False) -> Optional[str]:
-    """Validate structure, download missing/mismatched files, verify, and restart if needed.
+def _update_progress(stdscr, lines: list[str]) -> None:
+    if stdscr:
+        try:
+            stdscr.clear()
+        except Exception:
+            pass
+        _draw_center_box(stdscr, lines, CP.get('title', curses.A_BOLD))
+        try:
+            stdscr.refresh()
+        except Exception:
+            pass
+        return
+    logging.getLogger('client').info("update: %s", " | ".join(lines))
 
-    Returns target version on success, None on failure.
-    """
+
+def _manifest_entry_rel(entry: dict) -> Path:
+    return Path(str(entry.get('path') or ''))
+
+
+def _manifest_entry_dest(base: Path, entry: dict) -> Optional[Path]:
+    rel = _manifest_entry_rel(entry)
+    try:
+        dest = _map_destination(rel, base).resolve()
+    except Exception:
+        return None
+    if base not in dest.parents and base != dest:
+        return None
+    return dest
+
+
+def _download_entry(base_url: str, entry: dict, *, timeout: float = 15.0) -> Optional[bytes]:
+    rel = _manifest_entry_rel(entry)
+    url = base_url.rstrip('/') + '/' + rel.as_posix()
+    data = _fetch_url(url, timeout=timeout)
+    if not data:
+        logging.getLogger('client').error("Failed to download %s", url)
+        return None
+    if len(data) != int(entry['size']):
+        logging.getLogger('client').error("Size mismatch for %s", rel)
+        return None
+    h = hashlib.sha256()
+    h.update(data)
+    if h.hexdigest() != entry['sha256']:
+        logging.getLogger('client').error("Hash mismatch for %s", rel)
+        return None
+    return data
+
+
+def _stage_update_bytes(update_dir: Path, rel: Path, data: bytes, suffix: str) -> Optional[Path]:
+    tmp_path = update_dir / (rel.as_posix().replace('/', '_') + suffix)
+    try:
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.write_bytes(data)
+    except Exception as exc:
+        logging.getLogger('client').error("Failed to stage %s: %s", rel, exc)
+        return None
+    return tmp_path
+
+
+def _collect_staged_updates(
+    base_url: str,
+    entries: list[dict],
+    base: Path,
+    update_dir: Path,
+    stdscr=None,
+    *,
+    suffix: str = ".tmp",
+) -> Optional[tuple[list[tuple[Path, Path]], Optional[Path]]]:
+    staged: list[tuple[Path, Path]] = []
+    tar_path: Optional[Path] = None
+    total = len(entries)
+    for idx, entry in enumerate(entries, 1):
+        rel = _manifest_entry_rel(entry)
+        dest = _manifest_entry_dest(base, entry)
+        if dest is None:
+            continue
+        _update_progress(stdscr, [f"Загрузка {idx}/{total}", rel.as_posix()])
+        data = _download_entry(base_url, entry)
+        if not data:
+            return None
+        tmp_path = _stage_update_bytes(update_dir, rel, data, suffix)
+        if tmp_path is None:
+            return None
+        staged.append((tmp_path, dest))
+        if rel.as_posix() == "client-release.tar.gz":
+            tar_path = dest
+    return staged, tar_path
+
+
+def _install_staged_entry(tmp_path: Path, dest: Path) -> bool:
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        if dest.exists():
+            try:
+                backup = dest.with_suffix(dest.suffix + ".bak")
+                if not backup.exists():
+                    dest.replace(backup)
+            except Exception:
+                pass
+        tmp_path.replace(dest)
+        if dest.suffix == ".py":
+            try:
+                dest.chmod(0o755)
+            except Exception:
+                pass
+    except Exception as exc:
+        logging.getLogger('client').error("Failed to install %s: %s", dest, exc)
+        return False
+    return True
+
+
+def _install_staged_updates(staged: list[tuple[Path, Path]]) -> Optional[bool]:
+    changed = False
+    for tmp_path, dest in staged:
+        if not _install_staged_entry(tmp_path, dest):
+            return None
+        changed = True
+    return changed
+
+
+def _verify_manifest_entry(entry: dict, base: Path) -> bool:
+    rel = _manifest_entry_rel(entry)
+    dest = _manifest_entry_dest(base, entry)
+    if dest is None:
+        logging.getLogger('client').error("Unsafe path in manifest: %s", rel)
+        return False
+    if not dest.exists():
+        logging.getLogger('client').error("Missing file after update: %s", rel)
+        return False
+    if dest.stat().st_size != int(entry['size']):
+        logging.getLogger('client').error("Size mismatch after update: %s", rel)
+        return False
+    local_hash = _hash_file(dest)
+    if local_hash != entry['sha256']:
+        logging.getLogger('client').error("Hash mismatch after update: %s", rel)
+        return False
+    return True
+
+
+def _invalid_manifest_entries(entries: list[dict], base: Path) -> list[dict]:
+    return [entry for entry in entries if not _verify_manifest_entry(entry, base)]
+
+
+def _retry_invalid_manifest_entries(base_url: str, entries: list[dict], base: Path, update_dir: Path) -> Optional[bool]:
+    logging.getLogger('client').warning("Retrying download for %d missing/mismatched files", len(entries))
+    staged = _collect_staged_updates(base_url, entries, base, update_dir, suffix=".retry")
+    if staged is None:
+        return None
+    retry_staged, _tar_path = staged
+    return _install_staged_updates(retry_staged)
+
+
+def _restart_client(version: str) -> None:
+    try:
+        curses.endwin()
+    except Exception:
+        pass
+    restart_path: Optional[Path] = None
+    for candidate in (
+        (CLIENT_DIR / "bin" / "client.py"),
+        Path(__file__),
+        (CLIENT_DIR / "client.py"),
+    ):
+        try:
+            if candidate.exists():
+                restart_path = candidate.resolve()
+                break
+        except Exception:
+            continue
+    if restart_path is None:
+        restart_path = Path(__file__).resolve()
+    print(f"Обновлён клиент до версии {version or CLIENT_VERSION}. Перезапуск…")
+    os.execv(sys.executable, [sys.executable, str(restart_path)])
+
+
+def _validated_manifest_update(manifest: dict) -> Optional[tuple[list[dict], str]]:
     if not _fix_structure():
         logging.getLogger('client').error("Client structure invalid; cannot proceed with update")
         return None
@@ -1986,204 +1920,86 @@ def _apply_manifest_update(manifest: dict, base_url: str, stdscr=None, forced: b
     if not entries:
         logging.getLogger('client').error('Manifest has no valid entries')
         return None
-    # Root hash check (optional hardening)
     want_root = str(manifest.get('root_hash') or '')
     got_root = _manifest_root_hash(entries)
     if want_root and got_root and want_root != got_root:
         logging.getLogger('client').error('Manifest root hash mismatch')
         return None
-    version = str(manifest.get('version') or '')
+    return entries, str(manifest.get('version') or '')
+
+
+def _retry_manifest_update(base_url: str, entries: list[dict], base: Path, update_dir: Path, changed: bool) -> Optional[bool]:
+    bad_entries = _invalid_manifest_entries(entries, base)
+    if not bad_entries:
+        return changed
+    retry_changed = _retry_invalid_manifest_entries(base_url, bad_entries, base, update_dir)
+    if retry_changed is None:
+        return None
+    changed = changed or retry_changed
+    bad_entries = _invalid_manifest_entries(entries, base)
+    if bad_entries:
+        logging.getLogger('client').error("Update failed: files still invalid after retry: %s", [e.get('path') for e in bad_entries])
+        return None
+    return changed
+
+
+def _apply_update_archive(tar_path: Optional[Path], base: Path) -> bool:
+    if not tar_path or not tar_path.exists():
+        return False
+    if not _extract_client_release(tar_path, base):
+        logging.getLogger('client').error("Failed to extract client-release.tar.gz")
+        raise RuntimeError("update archive extraction failed")
+    return True
+
+
+def _log_manifest_extras(extras: list[str]) -> None:
+    if extras:
+        logging.getLogger('client').info("Extra files not in manifest: %s", ", ".join(extras))
+
+
+def _restart_if_changed(changed: bool, version: str) -> None:
+    if changed and not _is_ephemeral():
+        _restart_client(version)
+
+
+def _apply_manifest_update(manifest: dict, base_url: str, stdscr=None, forced: bool = False) -> Optional[str]:
+    """Validate structure, download missing/mismatched files, verify, and restart if needed.
+
+    Returns target version on success, None on failure.
+    """
+    manifest_state = _validated_manifest_update(manifest)
+    if manifest_state is None:
+        return None
+    entries, version = manifest_state
     to_get, extras = _manifest_diff(entries)
     base = CLIENT_DIR.resolve()
     update_dir = VAR_DIR / 'update'
     update_dir.mkdir(parents=True, exist_ok=True)
-    tar_path: Optional[Path] = None
 
-    def _progress(lines: list[str]):
-        if stdscr:
-            try:
-                stdscr.clear()
-            except Exception:
-                pass
-            _draw_center_box(stdscr, lines, CP.get('title', curses.A_BOLD))
-            try:
-                stdscr.refresh()
-            except Exception:
-                pass
-        else:
-            logging.getLogger('client').info("update: %s", " | ".join(lines))
-
-    if extras:
-        logging.getLogger('client').info("Extra files not in manifest: %s", ", ".join(extras))
-
+    _log_manifest_extras(extras)
     if not to_get:
         return version or CLIENT_VERSION
 
-    _progress(["Проверка обновлений…", f"Файлов к обновлению: {len(to_get)}"])
-    staged: list[tuple[Path, Path]] = []  # (tmp, dest)
-    for idx, entry in enumerate(to_get, 1):
-        rel = Path(entry['path'])
-        dest = _map_destination(rel, base).resolve()
-        if base not in dest.parents and base != dest:
-            continue
-        url = base_url.rstrip('/') + '/' + rel.as_posix()
-        _progress([f"Загрузка {idx}/{len(to_get)}", rel.as_posix()])
-        data = _fetch_url(url, timeout=15.0)
-        if not data:
-            logging.getLogger('client').error("Failed to download %s", url)
-            return None
-        if len(data) != int(entry['size']):
-            logging.getLogger('client').error("Size mismatch for %s", rel)
-            return None
-        h = hashlib.sha256()
-        h.update(data)
-        if h.hexdigest() != entry['sha256']:
-            logging.getLogger('client').error("Hash mismatch for %s", rel)
-            return None
-        tmp_path = update_dir / (rel.as_posix().replace('/', '_') + ".tmp")
-        try:
-            tmp_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path.write_bytes(data)
-        except Exception as exc:
-            logging.getLogger('client').error("Failed to stage %s: %s", rel, exc)
-            return None
-        staged.append((tmp_path, dest))
-        if rel.as_posix() == "client-release.tar.gz":
-            tar_path = dest
+    _update_progress(stdscr, ["Проверка обновлений…", f"Файлов к обновлению: {len(to_get)}"])
+    staged_result = _collect_staged_updates(base_url, to_get, base, update_dir, stdscr)
+    if staged_result is None:
+        return None
+    staged, tar_path = staged_result
+    changed = _install_staged_updates(staged)
+    if changed is None:
+        return None
 
-    # Apply staged files atomically
-    changed = False
-    for tmp_path, dest in staged:
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        try:
-            # Backup current file once if needed
-            if dest.exists():
-                try:
-                    backup = dest.with_suffix(dest.suffix + ".bak")
-                    if not backup.exists():
-                        dest.replace(backup)
-                except Exception:
-                    pass
-            tmp_path.replace(dest)
-            if dest.suffix == ".py":
-                try:
-                    dest.chmod(0o755)
-                except Exception:
-                    pass
-            changed = True
-        except Exception as exc:
-            logging.getLogger('client').error("Failed to install %s: %s", dest, exc)
-            return None
+    changed = _retry_manifest_update(base_url, entries, base, update_dir, changed)
+    if changed is None:
+        return None
 
-    # Final verification of all manifest entries. If something is missing or mismatched,
-    # try a one-shot re-download of just the bad entries to self-heal partial updates.
-    def _verify(entries_to_check: list[dict]) -> list[dict]:
-        bad: list[dict] = []
-        for entry in entries_to_check:
-            rel = Path(entry['path'])
-            dest = _map_destination(rel, base).resolve()
-            if base not in dest.parents and base != dest:
-                logging.getLogger('client').error("Unsafe path in manifest: %s", rel)
-                bad.append(entry)
-                continue
-            if not dest.exists():
-                logging.getLogger('client').error("Missing file after update: %s", rel)
-                bad.append(entry)
-                continue
-            if dest.stat().st_size != int(entry['size']):
-                logging.getLogger('client').error("Size mismatch after update: %s", rel)
-                bad.append(entry)
-                continue
-            local_hash = _hash_file(dest)
-            if local_hash != entry['sha256']:
-                logging.getLogger('client').error("Hash mismatch after update: %s", rel)
-                bad.append(entry)
-                continue
-        return bad
+    try:
+        changed = _apply_update_archive(tar_path, base) or changed
+    except RuntimeError:
+        return None
 
-    bad_entries = _verify(entries)
-    if bad_entries:
-        logging.getLogger('client').warning("Retrying download for %d missing/mismatched files", len(bad_entries))
-        # Re-download only the bad ones
-        staged_retry: list[tuple[Path, Path]] = []
-        for entry in bad_entries:
-            rel = Path(entry['path'])
-            dest = _map_destination(rel, base).resolve()
-            if base not in dest.parents and base != dest:
-                continue
-            data = _download_entry(base_url, entry)
-            if not data:
-                return None
-            try:
-                h = hashlib.sha256()
-                h.update(data)
-                if h.hexdigest() != entry['sha256']:
-                    logging.getLogger('client').error("Hash mismatch (retry) for %s", rel)
-                    return None
-                tmp_path = update_dir / (rel.as_posix().replace('/', '_') + ".retry")
-                tmp_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path.write_bytes(data)
-                staged_retry.append((tmp_path, dest))
-            except Exception as exc:
-                logging.getLogger('client').error("Failed to stage %s on retry: %s", rel, exc)
-                return None
-        # Apply retried files
-        for tmp_path, dest in staged_retry:
-            try:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
-            try:
-                tmp_path.replace(dest)
-                if dest.suffix == ".py":
-                    try:
-                        dest.chmod(0o755)
-                    except Exception:
-                        pass
-                changed = True
-            except Exception as exc:
-                logging.getLogger('client').error("Failed to install %s on retry: %s", dest, exc)
-                return None
-        bad_entries = _verify(entries)
-        if bad_entries:
-            logging.getLogger('client').error("Update failed: files still invalid after retry: %s", [e.get('path') for e in bad_entries])
-            return None
-
-    # Apply archive if present to refresh modules/config/bin layout
-    if tar_path and tar_path.exists():
-        if not _extract_client_release(tar_path, base):
-            logging.getLogger('client').error("Failed to extract client-release.tar.gz")
-            return None
-        changed = True
-
-    # Final cleanup to ensure forbidden files removed after update
     _fix_structure()
-
-    # Restart if anything changed (non-ephemeral)
-    if changed and not _is_ephemeral():
-        try:
-            curses.endwin()
-        except Exception:
-            pass
-        restart_path: Optional[Path] = None
-        for candidate in (
-            (CLIENT_DIR / "bin" / "client.py"),
-            Path(__file__),
-            (CLIENT_DIR / "client.py"),
-        ):
-            try:
-                if candidate.exists():
-                    restart_path = candidate.resolve()
-                    break
-            except Exception:
-                continue
-        if restart_path is None:
-            restart_path = Path(__file__).resolve()
-        print(f"Обновлён клиент до версии {version or CLIENT_VERSION}. Перезапуск…")
-        os.execv(sys.executable, [sys.executable, str(restart_path)])
+    _restart_if_changed(changed, version)
     return version or CLIENT_VERSION
 
 
@@ -2252,37 +2068,177 @@ def _draw_center_box(stdscr, lines: List[str], accent_attr: int = 0):
     # No refresh here; caller is responsible for a single end-of-frame refresh
 
 
+def _clear_stdscr(stdscr) -> None:
+    try:
+        stdscr.clear()
+    except Exception:
+        pass
+
+
+def _refresh_stdscr(stdscr) -> None:
+    try:
+        stdscr.refresh()
+    except Exception:
+        pass
+
+
+def _read_update_keypress(stdscr):
+    try:
+        return stdscr.get_wch()
+    except Exception:
+        return None
+
+
+def _is_accept_key(ch) -> bool:
+    if isinstance(ch, str) and ch in ("\x15", "\n", "\r", "y", "Y"):
+        return True
+    return ch in (curses.KEY_ENTER, 10, 13)
+
+
+def _is_cancel_key(ch) -> bool:
+    if isinstance(ch, str) and ch in ("\x1b", "n", "N"):
+        return True
+    return ch == 27
+
+
+def _set_last_update_error(message: str) -> None:
+    globals()["LAST_UPDATE_ERROR"] = message
+
+
+def _show_update_box(stdscr, lines: list[str], *, accent_attr: Optional[int] = None) -> None:
+    _draw_center_box(stdscr, lines, CP.get("title", curses.A_BOLD) if accent_attr is None else accent_attr)
+    _refresh_stdscr(stdscr)
+
+
+def _resolved_latest_version(latest: str) -> str:
+    return latest or CLIENT_VERSION
+
+
+def _manifest_bundle_ready(manifest: Optional[dict], entries: list[dict]) -> bool:
+    return manifest is not None and bool(entries)
+
+
+def _update_prompt_lines(current: str, latest: str, title: str) -> list[str]:
+    cur = str(current or "").strip() or "?"
+    lat = str(latest or "").strip() or "?"
+    lines = [title]
+    if cur and lat and cur != lat:
+        lines.append(f"{cur} → {lat}")
+    elif lat:
+        lines.append(f"Версия: {lat}")
+    lines.extend(["", "Нажмите Ctrl+U или Enter (OK) — обновить", "Esc или любая клавиша — позже"])
+    return lines
+
+
+def _store_update_pubkey(server_pk: bytes) -> bool:
+    if _is_ephemeral():
+        os.environ["UPDATE_PUBKEY"] = server_pk.hex()
+        return True
+    return _store_pinned_pubkey(server_pk)
+
+
+def _confirm_server_update_pubkey(stdscr, server_pk: bytes) -> bool:
+    fingerprint = hashlib.sha256(server_pk).hexdigest()[:16]
+    _show_update_box(
+        stdscr,
+        [
+            "Первичная настройка подписи обновлений",
+            f"Отпечаток ключа сервера: {fingerprint}",
+            "Доверять этому ключу? [Y] Да / [N] Нет",
+        ],
+    )
+    while True:
+        ch = _read_update_keypress(stdscr)
+        if _is_accept_key(ch):
+            return _store_update_pubkey(server_pk)
+        if _is_cancel_key(ch):
+            _set_last_update_error("Обновление отменено (ключ не подтверждён)")
+            return False
+
+
+def _load_update_manifest_bundle(base: str, *, forced: bool = False) -> tuple[Optional[dict], str, list[dict], list[dict]]:
+    manifest = _load_manifest(base, forced=forced)
+    if not isinstance(manifest, dict):
+        _set_last_update_error("Не удалось загрузить/верифицировать манифест")
+        return None, "", [], []
+    latest = str(manifest.get('version') or '')
+    entries = _safe_manifest_entries(manifest)
+    if not entries:
+        _set_last_update_error("Манифест повреждён")
+        return manifest, latest, [], []
+    to_get, _extras = _manifest_diff(entries)
+    return manifest, latest, entries, to_get
+
+
+def _show_update_step(stdscr, lines: list[str], *, sleep: float = 0.0, accent=None) -> None:
+    _clear_stdscr(stdscr)
+    _show_update_box(stdscr, ["Старт клиента", "Проверка обновлений…", *lines], accent_attr=accent or CP.get('title', curses.A_BOLD))
+    if sleep > 0:
+        time.sleep(sleep)
+
+
+def _wait_any_key(stdscr) -> None:
+    try:
+        stdscr.getch()
+    except Exception:
+        pass
+
+
+def _show_update_failure(stdscr, *lines: str) -> None:
+    rendered = [line for line in lines if line]
+    _show_update_step(stdscr, [*rendered, "Нажмите любую клавишу…"], accent=CP.get('error', curses.A_BOLD))
+    _wait_any_key(stdscr)
+
+
+def _confirm_interactive_update(stdscr, latest: str) -> bool:
+    _draw_center_box(
+        stdscr,
+        [
+            f"Доступно обновление клиента: {CLIENT_VERSION} → {latest}",
+            "Обновить сейчас? [Y] Да / [N] Нет",
+        ],
+        CP.get('title', curses.A_BOLD),
+    )
+    while True:
+        ch = stdscr.getch()
+        if ch in (ord('y'), ord('Y'), 10, 13):
+            return True
+        if ch in (ord('n'), ord('N'), 27):
+            return False
+
+
+def _startup_update_check_body(stdscr, base: str) -> Optional[str]:
+    _clear_stdscr(stdscr)
+    _show_update_box(stdscr, ["Старт клиента", "Проверка обновлений…"])
+    if not _ensure_update_pubkey_interactive(stdscr, base, forced=False):
+        return None
+    manifest, latest, entries, to_get = _load_update_manifest_bundle(base, forced=False)
+    if not _manifest_bundle_ready(manifest, entries):
+        return None
+    latest_version = _resolved_latest_version(latest)
+    if not to_get:
+        return latest_version
+    if not _prompt_update_available(stdscr, CLIENT_VERSION, latest_version):
+        return latest_version
+    result = _apply_manifest_update(manifest, base, stdscr=stdscr, forced=True)
+    if result:
+        return result
+    _set_last_update_error("Не удалось применить обновление")
+    return latest or None
+
+
 def _prompt_update_available(stdscr, current: str, latest: str, *, title: str = "Обнаружено обновление") -> bool:
     """Ask user whether to start update now.
 
     Returns True if user chose to update (Ctrl+U or Enter/OK), False otherwise.
     """
     try:
-        cur = str(current or "").strip() or "?"
-        lat = str(latest or "").strip() or "?"
-        lines = [title]
-        if cur and lat and cur != lat:
-            lines.append(f"{cur} → {lat}")
-        elif lat:
-            lines.append(f"Версия: {lat}")
-        lines.extend(["", "Нажмите Ctrl+U или Enter (OK) — обновить", "Esc или любая клавиша — позже"])
-        _draw_center_box(stdscr, lines, CP.get("title", curses.A_BOLD))
-        try:
-            stdscr.refresh()
-        except Exception:
-            pass
+        _show_update_box(stdscr, _update_prompt_lines(current, latest, title))
         while True:
-            try:
-                ch = stdscr.get_wch()
-            except Exception:
-                ch = None
-            if isinstance(ch, str) and ch == "\x15":
+            ch = _read_update_keypress(stdscr)
+            if _is_accept_key(ch):
                 return True
-            if isinstance(ch, str) and ch in ("\n", "\r"):
-                return True
-            if ch in (curses.KEY_ENTER, 10, 13):
-                return True
-            if (isinstance(ch, str) and ch in ("\x1b",)) or ch == 27:
+            if _is_cancel_key(ch):
                 return False
             if ch is not None:
                 return False
@@ -2297,39 +2253,11 @@ def _ensure_update_pubkey_interactive(stdscr, base: str, *, forced: bool = False
             return True
         server_pk = _attempt_fetch_server_pubkey(base)
         if server_pk is None:
-            globals()["LAST_UPDATE_ERROR"] = "Ключ обновлений не найден"
+            _set_last_update_error("Ключ обновлений не найден")
             return False
         if forced:
-            if _is_ephemeral():
-                os.environ["UPDATE_PUBKEY"] = server_pk.hex()
-            else:
-                _store_pinned_pubkey(server_pk)
-            return True
-        fp = hashlib.sha256(server_pk).hexdigest()[:16]
-        _draw_center_box(
-            stdscr,
-            [
-                "Первичная настройка подписи обновлений",
-                f"Отпечаток ключа сервера: {fp}",
-                "Доверять этому ключу? [Y] Да / [N] Нет",
-            ],
-            CP.get("title", curses.A_BOLD),
-        )
-        try:
-            stdscr.refresh()
-        except Exception:
-            pass
-        while True:
-            try:
-                ch = stdscr.get_wch()
-            except Exception:
-                ch = None
-            if (isinstance(ch, str) and ch in ("y", "Y", "\n", "\r")) or ch in (curses.KEY_ENTER, 10, 13):
-                _store_pinned_pubkey(server_pk)
-                return True
-            if (isinstance(ch, str) and ch in ("n", "N", "\x1b")) or ch == 27:
-                globals()["LAST_UPDATE_ERROR"] = "Обновление отменено (ключ не подтверждён)"
-                return False
+            return _store_update_pubkey(server_pk)
+        return _confirm_server_update_pubkey(stdscr, server_pk)
     except Exception:
         return False
 
@@ -2340,40 +2268,7 @@ def startup_update_check(stdscr) -> Optional[str]:
         base = _get_update_base_url()
         if not base:
             return None
-        # Best-effort lightweight startup UI
-        try:
-            stdscr.clear()
-        except Exception:
-            pass
-        _draw_center_box(stdscr, ["Старт клиента", "Проверка обновлений…"], CP.get("title", curses.A_BOLD))
-        try:
-            stdscr.refresh()
-        except Exception:
-            pass
-        # Ensure pubkey (TOFU confirmation if needed)
-        if not _ensure_update_pubkey_interactive(stdscr, base, forced=False):
-            return None
-        manifest = _load_manifest(base, forced=False)
-        if not isinstance(manifest, dict):
-            globals()["LAST_UPDATE_ERROR"] = "Не удалось загрузить/верифицировать манифест"
-            return None
-        latest = str(manifest.get("version") or "")
-        entries = _safe_manifest_entries(manifest)
-        if not entries:
-            globals()["LAST_UPDATE_ERROR"] = "Манифест повреждён"
-            return None
-        to_get, _ = _manifest_diff(entries)
-        if not to_get:
-            return latest or CLIENT_VERSION
-        if not _prompt_update_available(stdscr, CLIENT_VERSION, latest or CLIENT_VERSION):
-            # user chose to continue without updating
-            return latest or CLIENT_VERSION
-        # User confirmed update now: apply and restart if needed.
-        result = _apply_manifest_update(manifest, base, stdscr=stdscr, forced=True)
-        if not result:
-            globals()["LAST_UPDATE_ERROR"] = "Не удалось применить обновление"
-            return latest or None
-        return result
+        return _startup_update_check_body(stdscr, base)
     except Exception:
         logging.getLogger("client").exception("Startup update check failed")
         return None
@@ -2384,79 +2279,36 @@ def startup_update_check(stdscr) -> Optional[str]:
             pass
 
 
+def _interactive_update_check_body(stdscr, base: str, *, forced: bool, confirm: bool) -> Optional[str]:
+    _show_update_step(stdscr, ["Подключение к серверу обновлений…"], sleep=0.2)
+    if not _ensure_update_pubkey_interactive(stdscr, base, forced=forced):
+        err = str(globals().get("LAST_UPDATE_ERROR") or "Ключ обновлений не найден")
+        _show_update_failure(stdscr, err, "Обновление недоступно")
+        return None
+    _show_update_step(stdscr, ["Загрузка манифеста…"], sleep=0.1)
+    manifest, latest, entries, to_get = _load_update_manifest_bundle(base, forced=forced)
+    if not manifest or not entries:
+        _show_update_failure(stdscr, str(globals().get("LAST_UPDATE_ERROR") or "Не удалось загрузить/верифицировать манифест"))
+        return None
+    if not to_get:
+        return latest or CLIENT_VERSION
+    should_confirm = confirm and latest and latest != CLIENT_VERSION and not forced
+    if should_confirm and not _confirm_interactive_update(stdscr, latest):
+        return latest
+    result = _apply_manifest_update(manifest, base, stdscr=stdscr, forced=forced)
+    if result:
+        return result
+    _set_last_update_error("Не удалось применить обновление")
+    _show_update_failure(stdscr, "Не удалось применить обновление")
+    return None
+
+
 def interactive_update_check(stdscr, forced: bool = False, *, confirm: bool = True) -> Optional[str]:
     try:
         base = _get_update_base_url()
         if not base:
             return None
-        def _step(lines: list[str], sleep: float = 0.0, accent=CP.get('title', curses.A_BOLD)):
-            try:
-                stdscr.clear()
-            except Exception:
-                pass
-            _draw_center_box(stdscr, ["Старт клиента", "Проверка обновлений…", *lines], accent)
-            try:
-                stdscr.refresh()
-            except Exception:
-                pass
-            if sleep > 0:
-                time.sleep(sleep)
-        _step(["Подключение к серверу обновлений…"], 0.2)
-        if not _ensure_update_pubkey_interactive(stdscr, base, forced=forced):
-            err = str(globals().get("LAST_UPDATE_ERROR") or "Ключ обновлений не найден")
-            _step([err, "Обновление недоступно", "Нажмите любую клавишу…"], accent=CP.get('error', curses.A_BOLD))
-            try:
-                stdscr.getch()
-            except Exception:
-                pass
-            return None
-        _step(["Загрузка манифеста…"], 0.1)
-        manifest = _load_manifest(base, forced=forced)
-        if not isinstance(manifest, dict):
-            _step(["Не удалось загрузить/верифицировать манифест", "Нажмите любую клавишу…"], accent=CP.get('error', curses.A_BOLD))
-            globals()['LAST_UPDATE_ERROR'] = "Не удалось загрузить/верифицировать манифест"
-            try:
-                stdscr.getch()
-            except Exception:
-                pass
-            return None
-        latest = str(manifest.get('version') or '')
-        entries = _safe_manifest_entries(manifest)
-        if not entries:
-            _step(["Манифест пуст или повреждён", "Нажмите любую клавишу…"], accent=CP.get('error', curses.A_BOLD))
-            globals()['LAST_UPDATE_ERROR'] = "Манифест повреждён"
-            try:
-                stdscr.getch()
-            except Exception:
-                pass
-            return None
-        to_get, _ = _manifest_diff(entries)
-        if not to_get:
-            return latest or CLIENT_VERSION
-        if confirm and latest and latest != CLIENT_VERSION and not forced:
-            _draw_center_box(
-                stdscr,
-                [
-                    f"Доступно обновление клиента: {CLIENT_VERSION} → {latest}",
-                    "Обновить сейчас? [Y] Да / [N] Нет",
-                ],
-                CP.get('title', curses.A_BOLD),
-            )
-            while True:
-                ch = stdscr.getch()
-                if ch in (ord('y'), ord('Y'), 10, 13):
-                    break
-                if ch in (ord('n'), ord('N'), 27):
-                    return latest
-        result = _apply_manifest_update(manifest, base, stdscr=stdscr, forced=forced)
-        if not result:
-            _step(["Не удалось применить обновление", "Нажмите любую клавишу…"], accent=CP.get('error', curses.A_BOLD))
-            globals()['LAST_UPDATE_ERROR'] = "Не удалось применить обновление"
-            try:
-                stdscr.getch()
-            except Exception:
-                pass
-        return result
+        return _interactive_update_check_body(stdscr, base, forced=forced, confirm=confirm)
     except Exception:
         logging.getLogger('client').exception("Interactive update failed")
         return None
@@ -2554,76 +2406,100 @@ def _touch_user_history(peer: str) -> None:
     except Exception:
         logging.getLogger('client').exception("Failed to touch user history file for %s", peer)
 
+def _drop_peer_history_state(state: 'ClientState', peer: str) -> None:
+    try:
+        state.conversations.pop(peer, None)
+    except Exception:
+        pass
+    try:
+        state.unread.pop(peer, None)
+    except Exception:
+        pass
+    try:
+        if peer in state.history_last_ids:
+            state.history_last_ids.pop(peer, None)
+            save_history_index(state.history_last_ids)
+    except Exception:
+        pass
+
+
+def _remove_peer_user_history_file(peer: str) -> None:
+    try:
+        path = _users_dir() / f"{peer}.txt"
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def _keep_history_record(line: str, peer: str) -> bool:
+    try:
+        record = json.loads(line.strip())
+    except Exception:
+        return True
+    if not isinstance(record, dict):
+        return True
+    room = record.get('room')
+    if isinstance(room, str) and room:
+        return True
+    return record.get('from') != peer and record.get('to') != peer
+
+
+def _rewrite_history_without_peer(peer: str) -> None:
+    history_path = _history_path()
+    if not history_path.exists():
+        return
+    tmp_path = history_path.with_suffix('.tmp')
+    with open(history_path, 'r', encoding='utf-8') as src, open(tmp_path, 'w', encoding='utf-8') as dst:
+        for line in src:
+            if _keep_history_record(line, peer):
+                dst.write(line)
+    try:
+        os.replace(tmp_path, history_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
 def purge_local_history_for_peer(state: 'ClientState', peer: str) -> None:
     """Remove all cached local DM history with given peer (both directions).
 
     Keeps group history intact. Updates history index accordingly.
     """
     try:
-        # Drop in-memory conversation + counters
-        try:
-            if peer in state.conversations:
-                del state.conversations[peer]
-        except Exception:
-            pass
-        try:
-            state.unread.pop(peer, None)
-        except Exception:
-            pass
-        try:
-            if peer in state.history_last_ids:
-                state.history_last_ids.pop(peer, None)
-                save_history_index(state.history_last_ids)
-        except Exception:
-            pass
-        # Remove per-user txt history file as well
-        try:
-            hp_users = _users_dir() / f"{peer}.txt"
-            if hp_users.exists():
-                try:
-                    hp_users.unlink()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        _drop_peer_history_state(state, peer)
+        _remove_peer_user_history_file(peer)
         if _is_ephemeral():
             return
-        hp = _history_path()
-        if not hp.exists():
-            return
-        tmp = hp.with_suffix('.tmp')
-        with open(hp, 'r', encoding='utf-8') as fin, open(tmp, 'w', encoding='utf-8') as fout:
-            for line in fin:
-                try:
-                    rec = json.loads(line.strip())
-                except Exception:
-                    # Keep unknown lines
-                    fout.write(line)
-                    continue
-                if not isinstance(rec, dict):
-                    fout.write(line)
-                    continue
-                # Keep non-DM (rooms) and DMs not involving this peer
-                room = rec.get('room')
-                if isinstance(room, str) and room:
-                    fout.write(line)
-                    continue
-                frm = rec.get('from')
-                to = rec.get('to')
-                if frm == peer or to == peer:
-                    # Skip records involving this peer
-                    continue
-                fout.write(line)
-        try:
-            os.replace(tmp, hp)
-        except Exception:
-            # Fallback: remove tmp on failure
-            try:
-                tmp.unlink(missing_ok=True)  # type: ignore[attr-defined]
-            except Exception:
-                pass
+        _rewrite_history_without_peer(peer)
     except Exception:
         logging.getLogger('client').exception("Failed to purge local history for %s", peer)
+
+
+def _merge_history_index(state: 'ClientState') -> None:
+    for key, value in load_history_index().items():
+        if key not in state.history_last_ids:
+            state.history_last_ids[key] = int(value)
+
+
+def _history_message_from_record(state: 'ClientState', record: dict) -> Optional[Tuple[str, ChatMessage, object]]:
+    room = record.get('room')
+    to = record.get('to')
+    frm = record.get('from')
+    msg_id = record.get('id')
+    text = record.get('text', '')
+    ts = float(record.get('ts') or time.time())
+    if isinstance(room, str) and room:
+        direction = 'in' if frm != state.self_id else 'out'
+        return room, ChatMessage(direction, text, ts, sender=frm, msg_id=msg_id), msg_id
+    peer = to if frm == state.self_id else frm
+    if not peer:
+        return None
+    channel = str(peer)
+    direction = 'out' if frm == state.self_id else 'in'
+    return channel, ChatMessage(direction, text, ts, sender=frm, msg_id=msg_id), msg_id
 
 
 def load_local_history(state: 'ClientState') -> None:
@@ -2641,35 +2517,14 @@ def load_local_history(state: 'ClientState') -> None:
                     continue
                 if not isinstance(rec, dict):
                     continue
-                # Determine channel
-                room = rec.get('room')
-                to = rec.get('to')
-                frm = rec.get('from')
-                msg_id = rec.get('id')
-                text = rec.get('text', '')
-                ts = float(rec.get('ts') or time.time())
-                if isinstance(room, str) and room:
-                    # Group message
-                    chan = room
-                    m = ChatMessage('in' if frm != state.self_id else 'out', text, ts, sender=frm, msg_id=msg_id)
-                else:
-                    # Private: choose peer id
-                    peer = to if frm == state.self_id else frm
-                    if not peer:
-                        continue
-                    chan = str(peer)
-                    direction = 'out' if frm == state.self_id else 'in'
-                    m = ChatMessage(direction, text, ts, sender=frm, msg_id=msg_id)
-                lst = state.conversations.setdefault(chan, [])
-                lst.append(m)
-                # Track last ids per channel
+                parsed = _history_message_from_record(state, rec)
+                if parsed is None:
+                    continue
+                chan, message, msg_id = parsed
+                state.conversations.setdefault(chan, []).append(message)
                 if isinstance(msg_id, int):
                     state.history_last_ids[chan] = max(state.history_last_ids.get(chan, 0), int(msg_id))
-        # Also load index (for channels that might be missing ids)
-        idx = load_history_index()
-        for k, v in idx.items():
-            if k not in state.history_last_ids:
-                state.history_last_ids[k] = int(v)
+        _merge_history_index(state)
     except Exception:
         logging.getLogger('client').exception("Failed to load local history")
     state.history_loaded = True
@@ -2852,6 +2707,108 @@ def _fm_is_time_sort(sort: str) -> bool:
         return False
 
 
+def _fm_parent_items(path: Path) -> List[Tuple[str, bool]]:
+    try:
+        return [('..', True)] if path.parent and path.parent != path else []
+    except Exception:
+        return []
+
+
+def _fm_include_item(name: str, is_dir: bool, *, show_hidden: bool = False, view: Optional[str] = None) -> bool:
+    if name == '.':
+        return False
+    if (not show_hidden) and name.startswith('.'):
+        return False
+    if view == 'dirs' and (not is_dir):
+        return False
+    if view == 'files' and is_dir:
+        return False
+    return True
+
+
+def _fm_scandir_items(
+    path: Path,
+    *,
+    show_hidden: bool = False,
+    view: Optional[str] = None,
+) -> List[Tuple[str, bool]]:
+    items: List[Tuple[str, bool]] = []
+    with os.scandir(path) as it:
+        for ent in it:
+            try:
+                name = ent.name
+            except Exception:
+                continue
+            try:
+                is_dir = bool(ent.is_dir(follow_symlinks=False))
+            except Exception:
+                is_dir = False
+            if not _fm_include_item(name, is_dir, show_hidden=show_hidden, view=view):
+                continue
+            items.append((name, is_dir))
+    return items
+
+
+def _fm_sorted_items(
+    path: Path,
+    items: List[Tuple[str, bool]],
+    *,
+    sort: str = 'name',
+    dirs_first: bool = True,
+    reverse: bool = False,
+) -> List[Tuple[str, bool]]:
+    out = list(items)
+    if _fm_is_time_sort(sort):
+        sort_key = str(sort or '').strip().lower()
+
+        def time_key(entry: Tuple[str, bool]) -> float:
+            try:
+                st = (path / entry[0]).stat()
+                if sort_key in ('mtime', 'modified'):
+                    return float(st.st_mtime)
+                if sort_key in ('created',):
+                    ts = getattr(st, 'st_birthtime', None)
+                    return float(ts if ts is not None else st.st_ctime)
+                return float(st.st_ctime)
+            except Exception:
+                return 0.0
+
+        out.sort(key=time_key, reverse=bool(reverse))
+    else:
+        out.sort(key=lambda entry: entry[0].lower(), reverse=bool(reverse))
+    if dirs_first:
+        out = [entry for entry in out if entry[1]] + [entry for entry in out if not entry[1]]
+    return out
+
+
+def _fm_list_dir_opts_fallback(
+    path: str,
+    *,
+    show_hidden: bool = False,
+    sort: str = 'name',
+    dirs_first: bool = True,
+    reverse: bool = False,
+    view: Optional[str] = None,
+) -> Tuple[List[Tuple[str, bool]], Optional[str]]:
+    base = _fm_norm_path(path)
+    p = Path(base)
+    try:
+        items = _fm_scandir_items(p, show_hidden=show_hidden, view=view)
+    except PermissionError:
+        return _fm_parent_items(p), "Permission denied"
+    except FileNotFoundError:
+        return _fm_parent_items(p), "Not found"
+    except Exception as e:
+        return _fm_parent_items(p), str(e)
+    return _fm_parent_items(p) + _fm_sorted_items(
+        p,
+        items,
+        sort=sort,
+        dirs_first=dirs_first,
+        reverse=reverse,
+    ), None
+
+
 def _fm_list_dir_opts(
     path: str,
     *,
@@ -2865,70 +2822,28 @@ def _fm_list_dir_opts(
 
     Returns (items, err). Always includes '..' when parent exists.
     """
-    base = _fm_norm_path(path)
-    p = Path(base)
-    err: Optional[str] = None
-    items: List[Tuple[str, bool]] = []
-    out: List[Tuple[str, bool]] = []
     try:
-        with os.scandir(p) as it:
-            for ent in it:
-                try:
-                    name = ent.name
-                except Exception:
-                    continue
-                if name in ('.',):
-                    continue
-                if (not show_hidden) and name.startswith('.'):
-                    continue
-                is_dir = False
-                try:
-                    is_dir = bool(ent.is_dir(follow_symlinks=False))
-                except Exception:
-                    is_dir = False
-                if view == 'dirs' and (not is_dir):
-                    continue
-                if view == 'files' and is_dir:
-                    continue
-                out.append((name, is_dir))
-    except PermissionError:
-        return ([('..', True)] if p.parent and p.parent != p else [], "Permission denied")
-    except FileNotFoundError:
-        return ([('..', True)] if p.parent and p.parent != p else [], "Not found")
-    except Exception as e:
-        return ([('..', True)] if p.parent and p.parent != p else [], str(e))
-
-    if _fm_is_time_sort(sort):
-        s = str(sort or '').strip().lower()
-
-        def time_key(entry: Tuple[str, bool]) -> float:
-            try:
-                full = p / entry[0]
-                st = full.stat()
-                if s in ('mtime', 'modified'):
-                    return float(st.st_mtime)
-                if s in ('created',):
-                    ts = getattr(st, 'st_birthtime', None)
-                    return float(ts if ts is not None else st.st_ctime)
-                return float(st.st_ctime)
-            except Exception:
-                return 0.0
-
-        out.sort(key=time_key, reverse=bool(reverse))
-    else:
-        out.sort(key=lambda e: e[0].lower(), reverse=bool(reverse))
-
-    if dirs_first:
-        out = [e for e in out if e[1]] + [e for e in out if not e[1]]
-
-    # Parent row
-    try:
-        if p.parent and p.parent != p:
-            items.append(('..', True))
+        if not FILE_BROWSER_FALLBACK:
+            items, err = fb_list(
+                _fm_norm_path(path),
+                show_hidden=bool(show_hidden),
+                sort=str(sort or 'name'),
+                dirs_first=bool(dirs_first),
+                reverse=bool(reverse),
+                view=view,
+                return_err=True,
+            )
+            return list(items or []), err
     except Exception:
         pass
-    items.extend(out)
-    return items, err
+    return _fm_list_dir_opts_fallback(
+        path,
+        show_hidden=show_hidden,
+        sort=sort,
+        dirs_first=dirs_first,
+        reverse=reverse,
+        view=view,
+    )
 
 
 def _fm_filter_items(items: List[Tuple[str, bool]], filter_text: str) -> List[Tuple[str, bool]]:
@@ -2946,28 +2861,50 @@ def _fm_filter_items(items: List[Tuple[str, bool]], filter_text: str) -> List[Tu
     return out
 
 
+def _fm_selected_name(fm: FileManagerState, prefer_name: Optional[str]) -> Optional[str]:
+    if prefer_name is not None:
+        return prefer_name
+    try:
+        if fm.items:
+            idx = max(0, min(int(fm.index), len(fm.items) - 1))
+            return fm.items[idx][0]
+    except Exception:
+        pass
+    return None
+
+
+def _fm_reset_meta_cache(fm: FileManagerState) -> None:
+    try:
+        base_key = str(fm.path or "")
+        if getattr(fm, "meta_base", "") != base_key:
+            fm.meta_base = base_key
+            fm.meta.clear()
+    except Exception:
+        pass
+
+
+def _fm_restore_selection(fm: FileManagerState, cur_name: Optional[str]) -> None:
+    fallback = min(int(fm.index), max(0, len(fm.items) - 1))
+    if not cur_name:
+        fm.index = max(0, fallback)
+        return
+    try:
+        names = [name for name, _is_dir in fm.items]
+        fm.index = int(names.index(cur_name)) if cur_name in names else fallback
+    except Exception:
+        fm.index = fallback
+    fm.index = max(0, int(fm.index))
+
+
 def _fm_relist(fm: FileManagerState, *, prefer_name: Optional[str] = None, rescan: bool = True) -> None:
     try:
-        # Normalize path once per relist (avoid repeated resolve() in draw loop).
-        try:
-            norm = _fm_norm_path(fm.path)
-            if norm and norm != fm.path:
-                fm.path = norm
-        except Exception:
-            pass
-        cur_name = prefer_name
-        if cur_name is None and fm.items:
-            cur_name = fm.items[max(0, min(int(fm.index), len(fm.items) - 1))][0]
+        norm = _fm_norm_path(fm.path)
+        if norm and norm != fm.path:
+            fm.path = norm
+        cur_name = _fm_selected_name(fm, prefer_name)
         if rescan:
-            # Reset per-directory metadata cache when path changes.
-            try:
-                base_key = str(fm.path or "")
-                if getattr(fm, "meta_base", "") != base_key:
-                    fm.meta_base = base_key
-                    fm.meta.clear()
-            except Exception:
-                pass
-            items, err = _fm_list_dir_opts(
+            _fm_reset_meta_cache(fm)
+            fm.all_items, fm.err = _fm_list_dir_opts(
                 fm.path,
                 show_hidden=bool(fm.show_hidden),
                 sort=str(fm.sort or 'name'),
@@ -2975,23 +2912,8 @@ def _fm_relist(fm: FileManagerState, *, prefer_name: Optional[str] = None, resca
                 reverse=bool(fm.reverse),
                 view=fm.view,
             )
-            fm.all_items = items
-            fm.err = err
-        # Apply filter over cached directory listing (avoid hitting the FS on each keystroke).
         fm.items = _fm_filter_items(getattr(fm, "all_items", []) or [], fm.filter_text)
-        if cur_name:
-            try:
-                names = [n for (n, _) in fm.items]
-                if cur_name in names:
-                    fm.index = int(names.index(cur_name))
-                else:
-                    fm.index = min(int(fm.index), max(0, len(fm.items) - 1))
-            except Exception:
-                fm.index = min(int(fm.index), max(0, len(fm.items) - 1))
-        else:
-            fm.index = min(int(fm.index), max(0, len(fm.items) - 1))
-        if fm.index < 0:
-            fm.index = 0
+        _fm_restore_selection(fm, cur_name)
     except Exception:
         fm.all_items = []
         fm.items = []
@@ -3083,57 +3005,42 @@ def _fm_file_meta(fm: FileManagerState, base: Path, name: str) -> Tuple[str, str
     return size_s, mtime_s
 
 
-def _draw_file_manager_modal(stdscr, state: "ClientState", *, top_line: int = 1) -> None:
-    """Draw the F7 file manager overlay.
-
-    This is intentionally lightweight (no chat/history rendering behind it).
-    """
+def _fm_initial_path(prefs: Dict[str, object]) -> str:
+    start = _fm_norm_path('.')
     try:
-        h, w = stdscr.getmaxyx()
+        p0 = prefs.get('fb_path0')
+        if p0 and os.path.isdir(str(p0)):
+            return _fm_norm_path(str(p0))
+        home = _fm_norm_path('~')
+        if os.path.isdir(home):
+            return home
     except Exception:
-        return
+        pass
+    return start
+
+
+def _fm_ensure_state(state: "ClientState") -> Optional[FileManagerState]:
     try:
         fm = getattr(state, 'file_browser_state', None)
-        if not isinstance(fm, FileManagerState):
-            prefs = _get_fb_prefs()
-            start = _fm_norm_path('.')
-            try:
-                p0 = prefs.get('fb_path0')
-                if p0 and os.path.isdir(str(p0)):
-                    start = _fm_norm_path(str(p0))
-                else:
-                    home = _fm_norm_path('~')
-                    if os.path.isdir(home):
-                        start = home
-            except Exception:
-                pass
-            fm = FileManagerState(
-                path=start,
-                show_hidden=bool(prefs.get('fb_show_hidden0', False)),
-                sort=str(prefs.get('fb_sort0', 'name')),
-                dirs_first=bool(prefs.get('fb_dirs_first0', True)),
-                reverse=bool(prefs.get('fb_reverse0', False)),
-                view=prefs.get('fb_view0', None),
-            )
-            _fm_relist(fm)
-            state.file_browser_state = fm
+        if isinstance(fm, FileManagerState):
+            return fm
+        prefs = _get_fb_prefs()
+        fm = FileManagerState(
+            path=_fm_initial_path(prefs),
+            show_hidden=bool(prefs.get('fb_show_hidden0', False)),
+            sort=str(prefs.get('fb_sort0', 'name')),
+            dirs_first=bool(prefs.get('fb_dirs_first0', True)),
+            reverse=bool(prefs.get('fb_reverse0', False)),
+            view=prefs.get('fb_view0', None),
+        )
+        _fm_relist(fm)
+        state.file_browser_state = fm
+        return fm
     except Exception:
-        return
+        return None
 
-    header_y = int(top_line)
-    input_y = header_y + 1
-    list_top = header_y + 2
-    hint_y = max(0, h - 1)
-    list_rows = max(1, hint_y - list_top)
 
-    total = len(fm.items)
-    _fm_ensure_visible(fm, list_rows)
-    total = len(fm.items)
-    idx = int(getattr(fm, 'index', 0)) if total else 0
-    start = int(getattr(fm, 'scroll', 0)) if total else 0
-    end = min(total, start + list_rows)
-
-    # Header line: keep right-side flags visible, truncate path from the left.
+def _fm_header_line(fm: FileManagerState, width: int) -> str:
     try:
         mode_lab = {
             'browse': 'Файлы',
@@ -3150,101 +3057,161 @@ def _draw_file_manager_modal(stdscr, state: "ClientState", *, top_line: int = 1)
         sort_lab = 'имя'
         sort_order = '↑'
     flags = f"скрытые:{'Вкл' if fm.show_hidden else 'Выкл'}  сорт:{sort_lab}{sort_order}"
-    avail = max(0, w - display_width(flags) - 3)
-    path_disp = right_truncate_to_width(str(fm.path or ''), max(0, avail - display_width(mode_lab) - 3))
+    avail = max(0, width - display_width(flags) - 3)
+    path_width = max(0, avail - display_width(mode_lab) - 3)
+    path_disp = right_truncate_to_width(str(fm.path or ''), path_width)
     head = f" {mode_lab}: {path_disp}"
-    head = pad_to_width(head, avail) + "  " + flags
-    try:
-        stdscr.addnstr(header_y, 0, pad_to_width(head, w), w, CP.get('header', 0) or curses.A_REVERSE)
-    except Exception:
-        pass
+    return pad_to_width(head, avail) + "  " + flags
 
-    # Input line (filter / goto)
+
+def _fm_input_line(fm: FileManagerState) -> Tuple[str, int]:
     if fm.mode == 'goto':
         prompt = 'Путь: '
-        val = fm.goto_text or ''
+        value = fm.goto_text or ''
     else:
         prompt = 'Поиск: '
-        val = fm.filter_text or ''
+        value = fm.filter_text or ''
     if fm.mode in ('filter', 'goto'):
-        line = f" {prompt}{val}▌"
-        attr = CP.get('selected', curses.A_REVERSE)
-    else:
-        line = f" {prompt}{val}" if val else f" {prompt}/ (нажмите / для поиска)"
-        attr = CP.get('div', 0)
+        return f" {prompt}{value}▌", CP.get('selected', curses.A_REVERSE)
+    if value:
+        return f" {prompt}{value}", CP.get('div', 0)
+    return f" {prompt}/ (нажмите / для поиска)", CP.get('div', 0)
+
+
+def _fm_draw_line(stdscr, y: int, text: str, width: int, attr: int) -> None:
     try:
-        stdscr.addnstr(input_y, 0, pad_to_width(line, w), w, attr)
+        stdscr.addnstr(y, 0, pad_to_width(text, width), width, attr)
     except Exception:
         pass
 
-    # List rows (fast: show names only; details shown in the hint bar for selected item).
-    name_w = max(10, w)
-    base = Path(getattr(fm, 'meta_base', '') or (fm.path or '.'))
 
+def _fm_row_text(name: str, is_dir: bool, selected: bool, width: int) -> str:
+    marker = '>' if selected else ' '
+    if name == '..':
+        label = ".. (вверх)"
+        is_dir = True
+    else:
+        label = (name or '') + ('/' if is_dir else '')
+    return pad_to_width(f"{marker}{'/' if is_dir else ' '} {label}", max(10, width))
+
+
+def _fm_draw_rows(
+    stdscr,
+    fm: FileManagerState,
+    *,
+    list_top: int,
+    hint_y: int,
+    width: int,
+    idx: int,
+    start: int,
+    end: int,
+) -> None:
     y = list_top
-    if total == 0:
-        try:
-            stdscr.addnstr(y, 0, pad_to_width(" (пусто) ", w), w, CP.get('div', 0))
-        except Exception:
-            pass
+    if len(fm.items) == 0:
+        _fm_draw_line(stdscr, y, " (пусто) ", width, CP.get('div', 0))
         y += 1
     for row_i in range(start, end):
         try:
             name, is_dir = fm.items[row_i]
         except Exception:
             continue
-        selected = (row_i == idx)
-        marker = '>' if selected else ' '
-        if name == '..':
-            label = ".. (вверх)"
-            is_dir = True
-        else:
-            label = (name or '') + ('/' if is_dir else '')
-        row = pad_to_width(f"{marker}{'/' if is_dir else ' '} {label}", name_w)
-        try:
-            stdscr.addnstr(y, 0, pad_to_width(row, w), w, CP.get('selected', curses.A_REVERSE) if selected else CP.get('div', 0))
-        except Exception:
-            pass
+        attr = CP.get('selected', curses.A_REVERSE) if row_i == idx else CP.get('div', 0)
+        _fm_draw_line(stdscr, y, _fm_row_text(name, is_dir, row_i == idx, width), width, attr)
         y += 1
     while y < hint_y:
-        try:
-            stdscr.addnstr(y, 0, ' ' * w, w, CP.get('div', 0))
-        except Exception:
-            pass
+        _fm_draw_line(stdscr, y, '', width, CP.get('div', 0))
         y += 1
 
-    # Hint bar (includes selected item details to avoid per-row stat calls).
-    err = (fm.err or '').strip()
-    pos = "0/0"
-    sel_info = ""
+
+def _fm_selected_info(fm: FileManagerState, idx: int, total: int) -> Tuple[str, str]:
+    if total <= 0:
+        return "0/0", ""
     try:
-        if total > 0:
-            pos = f"{idx + 1}/{total}"
-            sname, sdir = fm.items[idx]
-            if sname == '..':
-                sel_info = ".. (вверх)"
-            elif sdir:
-                sel_info = f"{sname}/"
-            else:
-                size_s, date_s = _fm_file_meta(fm, base, sname)
-                meta_parts = [p for p in (size_s, date_s) if p]
-                if meta_parts:
-                    sel_info = f"{sname} ({', '.join(meta_parts)})"
-                else:
-                    sel_info = str(sname or '')
+        name, is_dir = fm.items[idx]
     except Exception:
-        pass
+        return "0/0", ""
+    if name == '..':
+        return f"{idx + 1}/{total}", ".. (вверх)"
+    if is_dir:
+        return f"{idx + 1}/{total}", f"{name}/"
+    base = Path(getattr(fm, 'meta_base', '') or (fm.path or '.'))
+    size_s, date_s = _fm_file_meta(fm, base, name)
+    meta_parts = [part for part in (size_s, date_s) if part]
+    if meta_parts:
+        return f"{idx + 1}/{total}", f"{name} ({', '.join(meta_parts)})"
+    return f"{idx + 1}/{total}", str(name or '')
+
+
+def _fm_hint_line(fm: FileManagerState, idx: int, total: int) -> str:
+    pos, sel_info = _fm_selected_info(fm, idx, total)
     hint = "Enter — открыть/выбрать | Backspace — вверх | / — поиск | Ctrl+L — путь | H — скрытые | S — сорт | R — порядок | D — папки | V — вид | F5 — обновить | Esc — закрыть"
-    if sel_info:
-        hint = f"{pos} | {sel_info} | {hint}"
-    else:
-        hint = f"{pos} | {hint}"
-    if err:
-        hint = f"{err} | {hint}"
+    hint = f"{pos} | {sel_info} | {hint}" if sel_info else f"{pos} | {hint}"
+    err = (fm.err or '').strip()
+    return f"{err} | {hint}" if err else hint
+
+
+def _fm_reset_overlays(state: "ClientState") -> None:
+    state.search_action_mode = False
+    state.action_menu_mode = False
+    state.profile_mode = False
+    state.profile_view_mode = False
+    state.modal_message = None
+    state.file_browser_view_mode = False
+    state.file_browser_settings_mode = False
+    state.file_browser_menu_mode = False
+
+
+def _fm_request_remote_prefs(state: "ClientState", net) -> None:
     try:
-        stdscr.addnstr(hint_y, 0, pad_to_width(' ' + hint + ' ', w), w, CP.get('header', 0) or curses.A_REVERSE)
+        if getattr(state, 'authed', False):
+            net.send({"type": getattr(T, 'PREFS_GET', 'prefs_get')})
     except Exception:
         pass
+
+
+def _fm_sync_legacy_fields(state: "ClientState", fm: FileManagerState) -> None:
+    try:
+        state.file_browser_path0 = str(fm.path or '')
+        state.file_browser_show_hidden0 = bool(fm.show_hidden)
+        state.file_browser_sort0 = str(fm.sort or 'name')
+        state.file_browser_dirs_first0 = bool(fm.dirs_first)
+        state.file_browser_reverse0 = bool(fm.reverse)
+        state.file_browser_view0 = fm.view
+    except Exception:
+        pass
+
+
+def _draw_file_manager_modal(stdscr, state: "ClientState", *, top_line: int = 1) -> None:
+    """Draw the F7 file manager overlay.
+
+    This is intentionally lightweight (no chat/history rendering behind it).
+    """
+    try:
+        h, w = stdscr.getmaxyx()
+    except Exception:
+        return
+    fm = _fm_ensure_state(state)
+    if not isinstance(fm, FileManagerState):
+        return
+
+    header_y = int(top_line)
+    input_y = header_y + 1
+    list_top = header_y + 2
+    hint_y = max(0, h - 1)
+    list_rows = max(1, hint_y - list_top)
+
+    total = len(fm.items)
+    _fm_ensure_visible(fm, list_rows)
+    total = len(fm.items)
+    idx = int(getattr(fm, 'index', 0)) if total else 0
+    start = int(getattr(fm, 'scroll', 0)) if total else 0
+    end = min(total, start + list_rows)
+    header_attr = CP.get('header', 0) or curses.A_REVERSE
+    input_line, input_attr = _fm_input_line(fm)
+    _fm_draw_line(stdscr, header_y, _fm_header_line(fm, w), w, header_attr)
+    _fm_draw_line(stdscr, input_y, input_line, w, input_attr)
+    _fm_draw_rows(stdscr, fm, list_top=list_top, hint_y=hint_y, width=w, idx=idx, start=start, end=end)
+    _fm_draw_line(stdscr, hint_y, ' ' + _fm_hint_line(fm, idx, total) + ' ', w, header_attr)
 
 
 def get_saved_id() -> Optional[str]:
@@ -3294,26 +3261,37 @@ def _is_ip_literal(host: str) -> bool:
         return False
 
 
-def _tls_server_hostname_for(host: str) -> Optional[str]:
+def _env_tls_sni_override() -> Optional[str]:
     override = str(os.environ.get('SERVER_TLS_SNI') or '').strip()
+    if not override:
+        return None
+    try:
+        return override if re.fullmatch(r"[A-Za-z0-9.-]{1,255}", override) else None
+    except Exception:
+        return None
+
+
+def _update_tls_hostname() -> Optional[str]:
+    try:
+        base = _get_update_base_url()
+        if not base:
+            return None
+        parsed = urlparse(base)
+        if parsed.hostname:
+            return str(parsed.hostname)
+    except Exception:
+        pass
+    return None
+
+
+def _tls_server_hostname_for(host: str) -> Optional[str]:
+    override = _env_tls_sni_override()
     if override:
-        try:
-            if re.fullmatch(r"[A-Za-z0-9.-]{1,255}", override):
-                return override
-        except Exception:
-            pass
+        return override
     h = (host or '').strip()
     if h and not _is_ip_literal(h) and h.lower() not in ('localhost',):
         return h
-    try:
-        base = _get_update_base_url()
-        if base:
-            u = urlparse(base)
-            if u.hostname:
-                return str(u.hostname)
-    except Exception:
-        pass
-    return h or None
+    return _update_tls_hostname() or h or None
 
 
 def _make_tls_context() -> ssl.SSLContext:
@@ -3349,77 +3327,102 @@ def _candidate_tls_ports(base_port: int) -> List[int]:
     return [int(base_port)]
 
 
+def _probe_candidate(host: str, port: int, timeout: float, *, use_tls: bool) -> Optional[Tuple[str, int, bool]]:
+    if try_connect(host, int(port), float(timeout), use_tls=use_tls):
+        return host, int(port), bool(use_tls)
+    return None
+
+
+def _probe_tls_candidates(host: str, ports: List[int], timeout: float) -> Optional[Tuple[str, int, bool]]:
+    for candidate_port in ports:
+        found = _probe_candidate(host, candidate_port, timeout, use_tls=True)
+        if found:
+            return found
+    return None
+
+
+def _probe_base_port_tls(host: str, port: int, timeout: float, tls_ports: List[int]) -> Optional[Tuple[str, int, bool]]:
+    if int(port) in set(tls_ports):
+        return None
+    return _probe_candidate(host, port, timeout, use_tls=True)
+
+
 def _probe_best_endpoint(host: str, port: int, timeout_per_try: float) -> Optional[Tuple[str, int, bool]]:
     tls_mode = _parse_tls_mode()
     if tls_mode == 'off':
-        if try_connect(host, port, timeout_per_try, use_tls=False):
-            return host, port, False
-        return None
+        return _probe_candidate(host, port, timeout_per_try, use_tls=False)
     tls_ports = []
     try:
         tls_ports = list(dict.fromkeys(_candidate_tls_ports(int(port))))
     except Exception:
         tls_ports = []
     tls_timeout = max(1.0, float(timeout_per_try))
-    for p in tls_ports:
-        if try_connect(host, int(p), tls_timeout, use_tls=True):
-            return host, int(p), True
+    tls_match = _probe_tls_candidates(host, tls_ports, tls_timeout)
+    if tls_match:
+        return tls_match
     # If TLS is required, do not attempt plaintext
     if tls_mode == 'on':
-        if int(port) not in set(tls_ports):
-            if try_connect(host, int(port), tls_timeout, use_tls=True):
-                return host, int(port), True
-        return None
+        return _probe_base_port_tls(host, port, tls_timeout, tls_ports)
     # AUTO: try plaintext on base port, then TLS on base port as a fallback (TLS-only cutover)
-    if try_connect(host, int(port), float(timeout_per_try), use_tls=False):
-        return host, int(port), False
-    if int(port) not in set(tls_ports):
-        if try_connect(host, int(port), tls_timeout, use_tls=True):
-            return host, int(port), True
-    return None
+    return _probe_candidate(host, port, float(timeout_per_try), use_tls=False) or _probe_base_port_tls(host, port, tls_timeout, tls_ports)
+
+
+def _parse_discovery_env_addr(env_addr: str) -> Tuple[str, int]:
+    if ':' in env_addr:
+        host, raw_port = env_addr.rsplit(':', 1)
+        return host, int(raw_port)
+    return env_addr, 7777
+
+
+def _probe_logged_endpoint(message: str, host: str, port: int, timeout_per_try: float) -> Optional[Tuple[str, int, bool]]:
+    logging.getLogger('client').info(message, host, port)
+    return _probe_best_endpoint(host, port, timeout_per_try)
+
+
+def _probe_saved_server(cfg: Tuple[str, int, bool], timeout_per_try: float) -> Optional[Tuple[str, int, bool]]:
+    host, port, tls = cfg
+    logging.getLogger('client').info("Trying saved server %s:%s (tls=%s)", host, port, int(bool(tls)))
+    if tls:
+        return _probe_candidate(host, port, max(1.0, timeout_per_try), use_tls=True)
+    return _probe_best_endpoint(host, port, timeout_per_try)
+
+
+def _discover_from_server_addr(timeout_per_try: float) -> Optional[Tuple[str, int, bool]]:
+    env_addr = os.environ.get('SERVER_ADDR')
+    if not env_addr:
+        return None
+    try:
+        host, port = _parse_discovery_env_addr(env_addr)
+    except Exception:
+        logging.getLogger('client').exception("Invalid SERVER_ADDR")
+        return None
+    return _probe_logged_endpoint("Using SERVER_ADDR %s:%s", host, port, timeout_per_try)
+
+
+def _discover_from_server_host(timeout_per_try: float) -> Optional[Tuple[str, int, bool]]:
+    env_host = os.environ.get('SERVER_HOST')
+    if not env_host:
+        return None
+    try:
+        port = int(os.environ.get('SERVER_PORT') or '7777')
+    except Exception:
+        logging.getLogger('client').exception("Invalid SERVER_HOST/PORT")
+        return None
+    return _probe_logged_endpoint("Trying SERVER_HOST %s:%s", env_host, port, timeout_per_try)
 
 
 def discover_server(timeout_per_try: float = 0.5) -> Optional[Tuple[str, int, bool]]:
-    # Highest priority: explicit env
-    env_addr = os.environ.get('SERVER_ADDR')
-    if env_addr:
-        try:
-            if ':' in env_addr:
-                host, p = env_addr.rsplit(':', 1)
-                port = int(p)
-            else:
-                host, port = env_addr, 7777
-            logging.getLogger('client').info("Using SERVER_ADDR %s:%s", host, port)
-            ep = _probe_best_endpoint(host, port, timeout_per_try)
-            if ep:
-                return ep
-        except Exception:
-            logging.getLogger('client').exception("Invalid SERVER_ADDR")
-
-    env_host = os.environ.get('SERVER_HOST')
-    env_port = os.environ.get('SERVER_PORT')
-    if env_host:
-        try:
-            port = int(env_port or '7777')
-            logging.getLogger('client').info("Trying SERVER_HOST %s:%s", env_host, port)
-            ep = _probe_best_endpoint(env_host, port, timeout_per_try)
-            if ep:
-                return ep
-        except Exception:
-            logging.getLogger('client').exception("Invalid SERVER_HOST/PORT")
+    for probe in (_discover_from_server_addr, _discover_from_server_host):
+        endpoint = probe(timeout_per_try)
+        if endpoint:
+            return endpoint
 
     # Try config first
     cfg = load_config()
     if cfg:
-        host, port, tls = cfg
-        logging.getLogger('client').info("Trying saved server %s:%s (tls=%s)", host, port, int(bool(tls)))
-        if tls:
-            if try_connect(host, port, max(1.0, timeout_per_try), use_tls=True):
-                return host, port, True
-        else:
-            ep = _probe_best_endpoint(host, port, timeout_per_try)
-            if ep:
-                return ep
+        ep = _probe_saved_server(cfg, timeout_per_try)
+        if ep:
+            return ep
 
     # Try defaults (prod hosts only; localhost не используем как fallback)
     candidates = [
@@ -3427,11 +3430,46 @@ def discover_server(timeout_per_try: float = 0.5) -> Optional[Tuple[str, int, bo
         ("168.222.252.108", 7778),
     ]
     for host, port in candidates:
-        logging.getLogger('client').info("Probing server %s:%s", host, port)
-        ep = _probe_best_endpoint(host, port, timeout_per_try)
+        ep = _probe_logged_endpoint("Probing server %s:%s", host, port, timeout_per_try)
         if ep:
             return ep
     return None
+
+
+def _wrap_probe_socket(sock: socket.socket, host: str, *, use_tls: bool) -> socket.socket:
+    if not use_tls:
+        return sock
+    ctx = _make_tls_context()
+    server_hostname = None
+    if _tls_verify_enabled():
+        server_hostname = _tls_server_hostname_for(host) or host
+    return ctx.wrap_socket(sock, server_hostname=server_hostname)
+
+
+def _close_probe_socket(sock: socket.socket, reader) -> None:
+    try:
+        reader.close()
+    except Exception:
+        pass
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    sock.close()
+
+
+def _probe_welcome_ok(line: bytes, log: logging.Logger) -> bool:
+    if not line:
+        log.warning("Probe got empty response")
+        return False
+    try:
+        msg = json.loads(line.decode('utf-8'))
+        ok = msg.get('type') == T.WELCOME
+        log.debug("Probe welcome: %s", msg)
+        return ok
+    except Exception:
+        log.exception("Probe response not JSON")
+        return False
 
 
 def try_connect(host: str, port: int, timeout: float, *, use_tls: bool = False) -> bool:
@@ -3441,35 +3479,12 @@ def try_connect(host: str, port: int, timeout: float, *, use_tls: bool = False) 
         sock.settimeout(timeout)
         log.debug("Connecting to %s:%s (tls=%s) timeout=%s", host, port, int(bool(use_tls)), timeout)
         sock.connect((host, port))
-        if use_tls:
-            ctx = _make_tls_context()
-            server_hostname = None
-            if _tls_verify_enabled():
-                server_hostname = _tls_server_hostname_for(host) or host
-            sock = ctx.wrap_socket(sock, server_hostname=server_hostname)
+        sock = _wrap_probe_socket(sock, host, use_tls=use_tls)
         # Read one line expecting welcome
-        f = sock.makefile('rb')
-        line = f.readline()
-        try:
-            f.close()
-        except Exception:
-            pass
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
-        sock.close()
-        if not line:
-            log.warning("Probe got empty response")
-            return False
-        try:
-            msg = json.loads(line.decode('utf-8'))
-            ok = msg.get('type') == T.WELCOME
-            log.debug("Probe welcome: %s", msg)
-            return ok
-        except Exception:
-            log.exception("Probe response not JSON")
-            return False
+        reader = sock.makefile('rb')
+        line = reader.readline()
+        _close_probe_socket(sock, reader)
+        return _probe_welcome_ok(line, log)
     except Exception:
         logging.getLogger('client.net').exception("Probe connect failed")
         return False
@@ -3939,6 +3954,47 @@ def _clamp_history_scroll(state: object) -> None:
         pass
 
 
+def _is_read_receipt_target(state: object, peer: str) -> bool:
+    try:
+        if is_separator(peer):
+            return False
+    except Exception:
+        pass
+    try:
+        if peer in getattr(state, 'groups', {}):
+            return False
+    except Exception:
+        pass
+    try:
+        if peer in getattr(state, 'boards', {}):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _peer_unread_count(state: object, peer: str) -> int:
+    try:
+        unread_map = getattr(state, 'unread', {}) or {}
+        return int(unread_map.get(str(peer), 0) or 0)
+    except Exception:
+        return 0
+
+
+def _clear_local_unread_count(state: object, peer: str) -> None:
+    try:
+        unread_map = getattr(state, 'unread', {}) or {}
+        unread_map[str(peer)] = 0
+        setattr(state, 'unread', unread_map)
+        return
+    except Exception:
+        pass
+    try:
+        state.unread[str(peer)] = 0  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def _maybe_send_message_read(state: object, net: object, peer: Optional[str]) -> None:
     """Send message_read only when it can actually change state (unread>0).
 
@@ -3947,37 +4003,11 @@ def _maybe_send_message_read(state: object, net: object, peer: Optional[str]) ->
     """
     if not peer:
         return
-    try:
-        if is_separator(peer):
-            return
-    except Exception:
-        pass
-    try:
-        if peer in getattr(state, 'groups', {}):
-            return
-    except Exception:
-        pass
-    try:
-        if peer in getattr(state, 'boards', {}):
-            return
-    except Exception:
-        pass
-    try:
-        unread_map = getattr(state, 'unread', {}) or {}
-        unread = int(unread_map.get(str(peer), 0) or 0)
-    except Exception:
-        unread = 0
-    if unread <= 0:
+    if not _is_read_receipt_target(state, peer):
         return
-    try:
-        # Optimistically clear locally so UI updates immediately.
-        unread_map[str(peer)] = 0
-        setattr(state, 'unread', unread_map)
-    except Exception:
-        try:
-            state.unread[str(peer)] = 0  # type: ignore[attr-defined]
-        except Exception:
-            pass
+    if _peer_unread_count(state, peer) <= 0:
+        return
+    _clear_local_unread_count(state, peer)
     try:
         net.send({"type": "message_read", "peer": str(peer)})
     except Exception:
@@ -4009,64 +4039,59 @@ def _mouse_button_masks(button: int) -> Tuple[int, int]:
     return _mouse_mask(press_names), _mouse_mask(release_names)
 
 
+def _parse_sgr_mouse_event(seq: str) -> Optional[Tuple[int, int, int, str]]:
+    match_sgr = _SGR_MOUSE_RE1.match(seq)
+    match_urxvt = None if match_sgr else _SGR_MOUSE_RE2.match(seq)
+    if match_sgr or match_urxvt:
+        match = match_sgr or match_urxvt
+        try:
+            cb_raw = int(match.group('b'))
+            mx = max(0, int(match.group('x')) - 1)
+            my = max(0, int(match.group('y')) - 1)
+            event_type = match.group('t')
+        except Exception:
+            return None
+        cb = cb_raw if match_sgr else (cb_raw - 32)
+        if cb < 0:
+            return None
+        return mx, my, cb, event_type
+    match_x10 = _X10_MOUSE_RE.match(seq)
+    if not match_x10:
+        return None
+    cb = ord(match_x10.group('b')) - 32
+    mx = max(0, ord(match_x10.group('x')) - 32 - 1)
+    my = max(0, ord(match_x10.group('y')) - 32 - 1)
+    return mx, my, cb, 'M'
+
+
+def _wheel_bstate(cb: int) -> int:
+    wheel_up, wheel_down = _compute_wheel_masks()
+    return wheel_up if (cb & 1) == 0 else wheel_down
+
+
+def _button_bstate(cb: int, event_type: str) -> int:
+    button = cb & 3
+    if button == 3:
+        if cb & 0x20:
+            return 0
+        press_mask, release_mask = _mouse_button_masks(0)
+        return release_mask or press_mask
+    press_mask, release_mask = _mouse_button_masks(button)
+    if event_type == 'm':
+        return release_mask or press_mask
+    return press_mask or release_mask
+
+
 def _parse_sgr_mouse(seq: str) -> Optional[Tuple[int, int, int]]:
     """
     Convert an SGR/X10 mouse escape sequence to (x, y, bstate) usable with curses.ungetmouse.
     Returns None if the sequence is not a mouse event.
     """
-    # Two common encodings:
-    # - SGR 1006: CSI < b ; x ; y M/m   (b is decoded button code)
-    # - URXVT 1015: CSI b ; x ; y M/m  (b is X10-style and includes +32 offset)
-    m1 = _SGR_MOUSE_RE1.match(seq)
-    m2 = None if m1 else _SGR_MOUSE_RE2.match(seq)
-    if m1 or m2:
-        m = m1 or m2
-        try:
-            cb_raw = int(m.group('b'))
-            mx = max(0, int(m.group('x')) - 1)
-            my = max(0, int(m.group('y')) - 1)
-            t = m.group('t')
-        except Exception:
-            return None
-        # Decode 1015's +32 offset so bit tests (wheel/motion/modifiers) are correct.
-        cb = cb_raw if m1 else (cb_raw - 32)
-        if cb < 0:
-            return None
-    else:
-        m2 = _X10_MOUSE_RE.match(seq)
-        if not m2:
-            return None
-        cb = ord(m2.group('b')) - 32
-        mx = max(0, ord(m2.group('x')) - 32 - 1)
-        my = max(0, ord(m2.group('y')) - 32 - 1)
-        t = 'M'
-
-    wheel_up, wheel_down = _compute_wheel_masks()
-    bstate = 0
-
-    if cb & 0x40:
-        # Wheel event (bit 6 set): map to BUTTON4/BUTTON5 so downstream wheel logic fires
-        if (cb & 1) == 0:
-            bstate |= wheel_up
-        else:
-            bstate |= wheel_down
-    else:
-        btn = cb & 3
-        if btn == 3:
-            # Many terminals (notably URXVT 1015) encode button release as btn=3 (often with trailing 'M').
-            # Treat non-motion releases as a left-button release so contact clicks work reliably.
-            # If motion bit is set, this is likely "hover" and should be ignored.
-            if cb & 0x20:
-                return None
-            _press_mask, release_mask = _mouse_button_masks(0)
-            bstate |= release_mask or _press_mask
-        else:
-            press_mask, release_mask = _mouse_button_masks(btn)
-            if t == 'm':
-                bstate |= release_mask or press_mask
-            else:
-                bstate |= press_mask or release_mask
-
+    parsed = _parse_sgr_mouse_event(seq)
+    if parsed is None:
+        return None
+    mx, my, cb, event_type = parsed
+    bstate = _wheel_bstate(cb) if cb & 0x40 else _button_bstate(cb, event_type)
     if bstate == 0:
         return None
     return mx, my, bstate
@@ -4104,177 +4129,249 @@ class NetworkClient(threading.Thread):
                 self._tls_ctx = None
                 self._tls_server_hostname = None
 
+    def _put_net_status(self, status: str) -> None:
+        self.incoming.put({"type": "net_status", "status": status})
+
+    def _pending_bytes(self) -> int:
+        try:
+            if hasattr(self.sock, "pending"):
+                return int(getattr(self.sock, "pending")())  # type: ignore[misc]
+        except Exception:
+            pass
+        return 0
+
+    def _open_transport(self, log) -> None:
+        self._put_net_status("reconnecting")
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        log.info("Connecting to %s://%s:%s", "tls" if self.use_tls else "tcp", self.host, self.port)
+        raw_sock.settimeout(5.0)
+        raw_sock.connect((self.host, self.port))
+        self.sock = self._wrap_transport(raw_sock)
+
+    def _wrap_transport(self, raw_sock: socket.socket) -> socket.socket:
+        if self.use_tls and self._tls_ctx is not None:
+            tls_sock = self._tls_ctx.wrap_socket(
+                raw_sock,
+                server_hostname=(self._tls_server_hostname if _tls_verify_enabled() else None),
+                do_handshake_on_connect=False,
+            )
+            tls_sock.settimeout(5.0)
+            tls_sock.do_handshake()
+            tls_sock.setblocking(False)
+            return tls_sock
+        raw_sock.setblocking(False)
+        return raw_sock
+
+    def _parse_welcome_message(self, welcome: bytes, log) -> dict:
+        try:
+            msg = json.loads(welcome.decode('utf-8'))
+        except Exception as e:
+            log.exception("Invalid welcome parse")
+            raise RuntimeError("Invalid welcome") from e
+        if msg.get('type') != T.WELCOME:
+            log.error("Unexpected first message: %s", msg)
+            raise RuntimeError("Unexpected first message")
+        return msg
+
+    def _accept_welcome(self, log) -> None:
+        welcome = self._read_line_blocking(timeout=5.0)
+        if not welcome:
+            log.error("No welcome from server")
+            raise RuntimeError("No welcome from server")
+        msg = self._parse_welcome_message(welcome, log)
+        log.info("Welcome received: %s", msg)
+        self.incoming.put(msg)
+        self._put_net_status("connected")
+
+    def _select_ready(self, out_buf: bytes) -> Tuple[int, List[socket.socket], List[socket.socket]]:
+        pending = self._pending_bytes()
+        try:
+            r_watch = [] if pending > 0 else [self.sock]
+            w_watch = [self.sock] if out_buf else []
+            rlist, wlist, _ = select.select(r_watch, w_watch, [], 0.1)
+            return pending, list(rlist), list(wlist)
+        except Exception:
+            return 0, [], []
+
+    def _enforce_frame_limit(self, size: int, log, *, label: str) -> None:
+        if self._max_frame_bytes and size > self._max_frame_bytes:
+            log.error("Incoming %s exceeds max size (%s bytes); closing", label, self._max_frame_bytes)
+            raise RuntimeError("frame_too_large")
+
+    def _recv_chunk(self, log) -> Tuple[bool, bytes]:
+        try:
+            return True, self.sock.recv(4096)
+        except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            return False, b""
+        except Exception as e:
+            log.exception("Recv failed")
+            raise RuntimeError("recv_failed") from e
+
+    def _queue_incoming_debug(self, msg: dict) -> None:
+        try:
+            self.incoming.put({"type": "debug_log", "dir": "in", "payload": msg, "ts": time.time()})
+        except Exception:
+            pass
+
+    def _process_incoming_line(self, line: bytes, log) -> None:
+        if not line:
+            return
+        self._enforce_frame_limit(len(line), log, label="line")
+        try:
+            msg = json.loads(line.decode('utf-8'))
+            self.recv_count += 1
+            log.debug("Incoming[%s]: %s", self.recv_count, msg)
+            self.incoming.put(msg)
+            self._queue_incoming_debug(msg)
+        except Exception:
+            log.exception("Invalid JSON from server")
+
+    def _drain_incoming_buffer(self, buffer: bytes, log) -> bytes:
+        self._enforce_frame_limit(len(buffer), log, label="frame")
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            self._process_incoming_line(line, log)
+        return buffer
+
+    def _read_ready_socket(self, buffer: bytes, log) -> bytes:
+        received, data = self._recv_chunk(log)
+        if not received:
+            return buffer
+        if not data:
+            log.warning("Socket closed by server")
+            raise RuntimeError("socket_closed")
+        return self._drain_incoming_buffer(buffer + data, log)
+
+    def _next_outgoing_payload(self) -> Optional[dict]:
+        try:
+            return self.outgoing.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _append_outgoing_payload(self, out_buf: bytes, log) -> bytes:
+        outgoing = self._next_outgoing_payload()
+        if outgoing is None:
+            return out_buf
+        try:
+            payload = (json.dumps(outgoing, ensure_ascii=False) + "\n").encode('utf-8')
+            self.sent_count += 1
+            log.debug("Outgoing[%s]: %s", self.sent_count, outgoing)
+            return out_buf + payload
+        except Exception as e:
+            log.exception("Encode outgoing failed")
+            raise RuntimeError("encode_outgoing_failed") from e
+
+    def _flush_outgoing_buffer(self, out_buf: bytes, wlist: List[socket.socket], log) -> bytes:
+        if not (out_buf and wlist):
+            return out_buf
+        try:
+            sent = self.sock.send(out_buf)
+            return out_buf[sent:] if sent > 0 else out_buf
+        except (BlockingIOError, ssl.SSLWantWriteError, ssl.SSLWantReadError):
+            return out_buf
+        except Exception as e:
+            log.exception("Send failed")
+            raise RuntimeError("send_failed") from e
+
+    def _maybe_ping(self, last_ping: float, log) -> float:
+        if time.time() - last_ping <= 20:
+            return last_ping
+        try:
+            self.send({"type": T.PING})
+        except Exception:
+            log.exception("Ping queue failed")
+        return time.time()
+
+    def _serve_connection(self, log) -> None:
+        last_ping = time.time()
+        buffer = self._prebuffer or b""
+        out_buf = b""
+        while not self.stop_event.is_set():
+            pending, rlist, wlist = self._select_ready(out_buf)
+            if pending > 0 or rlist:
+                buffer = self._read_ready_socket(buffer, log)
+            out_buf = self._append_outgoing_payload(out_buf, log)
+            out_buf = self._flush_outgoing_buffer(out_buf, wlist, log)
+            last_ping = self._maybe_ping(last_ping, log)
+
+    def _close_conn_handle(self, name: str) -> None:
+        handle = getattr(self, name, None)
+        try:
+            if handle:
+                handle.close()
+        except Exception:
+            pass
+
+    def _cleanup_connection(self, was_connected: bool, backoff: float) -> float:
+        self._close_conn_handle("file_r")
+        self._close_conn_handle("file_w")
+        self._close_conn_handle("sock")
+        self.file_r = None
+        self.file_w = None
+        self.sock = None
+        self._prebuffer = b""
+        if was_connected:
+            self._put_net_status("disconnected")
+        if self.stop_event.is_set():
+            return backoff
+        time.sleep(min(5.0, backoff))
+        return min(5.0, backoff * 1.5)
+
     def run(self):
         log = logging.getLogger('client.net')
         backoff = 1.0
         was_connected = False
         while not self.stop_event.is_set():
             try:
-                # Signal attempt
-                self.incoming.put({"type": "net_status", "status": "reconnecting"})
-                raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                log.info("Connecting to %s://%s:%s", "tls" if self.use_tls else "tcp", self.host, self.port)
-                raw_sock.settimeout(5.0)
-                raw_sock.connect((self.host, self.port))
-                if self.use_tls and self._tls_ctx is not None:
-                    tls_sock = self._tls_ctx.wrap_socket(
-                        raw_sock,
-                        server_hostname=(self._tls_server_hostname if _tls_verify_enabled() else None),
-                        do_handshake_on_connect=False,
-                    )
-                    tls_sock.settimeout(5.0)
-                    tls_sock.do_handshake()
-                    tls_sock.setblocking(False)
-                    self.sock = tls_sock
-                else:
-                    raw_sock.setblocking(False)
-                    self.sock = raw_sock
-
-                # Expect welcome
-                welcome = self._read_line_blocking(timeout=5.0)
-                if not welcome:
-                    log.error("No welcome from server")
-                    raise RuntimeError("No welcome from server")
-                try:
-                    msg = json.loads(welcome.decode('utf-8'))
-                    if msg.get('type') == T.WELCOME:
-                        log.info("Welcome received: %s", msg)
-                        self.incoming.put(msg)
-                        self.incoming.put({"type": "net_status", "status": "connected"})
-                        was_connected = True
-                    else:
-                        log.error("Unexpected first message: %s", msg)
-                        raise RuntimeError("Unexpected first message")
-                except Exception as e:
-                    log.exception("Invalid welcome parse")
-                    raise RuntimeError("Invalid welcome") from e
-
-                last_ping = time.time()
-                # Main loop: read + write
-                buffer = self._prebuffer or b""
-                out_buf = b""
-                while not self.stop_event.is_set():
-                    try:
-                        pending = 0
-                        try:
-                            if hasattr(self.sock, "pending"):
-                                pending = int(getattr(self.sock, "pending")())  # type: ignore[misc]
-                        except Exception:
-                            pending = 0
-                        r_watch = [] if pending > 0 else [self.sock]
-                        w_watch = [self.sock] if out_buf else []
-                        rlist, wlist, _ = select.select(r_watch, w_watch, [], 0.1)
-                    except Exception:
-                        rlist, wlist, pending = ([], [], 0)
-                    if pending > 0 or rlist:
-                        try:
-                            data = self.sock.recv(4096)
-                        except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
-                            data = b""
-                        except Exception:
-                            log.exception("Recv failed")
-                            break
-                        if data:
-                            buffer += data
-                            try:
-                                if self._max_frame_bytes and len(buffer) > self._max_frame_bytes:
-                                    log.error("Incoming frame exceeds max size (%s bytes); closing", self._max_frame_bytes)
-                                    raise RuntimeError("frame_too_large")
-                            except Exception:
-                                raise
-                            while b"\n" in buffer:
-                                line, buffer = buffer.split(b"\n", 1)
-                                if not line:
-                                    continue
-                                try:
-                                    if self._max_frame_bytes and len(line) > self._max_frame_bytes:
-                                        log.error("Incoming line exceeds max size (%s bytes); closing", self._max_frame_bytes)
-                                        raise RuntimeError("frame_too_large")
-                                except Exception:
-                                    raise
-                                try:
-                                    msg = json.loads(line.decode('utf-8'))
-                                    self.recv_count += 1
-                                    log.debug("Incoming[%s]: %s", self.recv_count, msg)
-                                    self.incoming.put(msg)
-                                    try:
-                                        self.incoming.put({"type": "debug_log", "dir": "in", "payload": msg, "ts": time.time()})
-                                    except Exception:
-                                        pass
-                                except Exception:
-                                    log.exception("Invalid JSON from server")
-                                    pass
-                        else:
-                            # socket closed by server
-                            log.warning("Socket closed by server")
-                            break
-                    # Outgoing: enqueue into out_buf, then flush when socket is writable
-                    try:
-                        outgoing = self.outgoing.get_nowait()
-                    except queue.Empty:
-                        outgoing = None
-                    if outgoing is not None:
-                        try:
-                            payload = (json.dumps(outgoing, ensure_ascii=False) + "\n").encode('utf-8')
-                            self.sent_count += 1
-                            log.debug("Outgoing[%s]: %s", self.sent_count, outgoing)
-                            out_buf += payload
-                        except Exception:
-                            log.exception("Encode outgoing failed")
-                            break
-                    if out_buf and wlist:
-                        try:
-                            sent = self.sock.send(out_buf)
-                            if sent > 0:
-                                out_buf = out_buf[sent:]
-                        except (BlockingIOError, ssl.SSLWantWriteError, ssl.SSLWantReadError):
-                            pass
-                        except Exception:
-                            log.exception("Send failed")
-                            break
-
-                    # Ping every 20s (optional)
-                    if time.time() - last_ping > 20:
-                        try:
-                            self.send({"type": T.PING})
-                        except Exception:
-                            log.exception("Ping queue failed")
-                            pass
-                        last_ping = time.time()
-
-                # Loop will reconnect
+                self._open_transport(log)
+                self._accept_welcome(log)
+                was_connected = True
+                self._serve_connection(log)
                 raise RuntimeError("Connection loop ended")
             except Exception:
                 log.exception("Network error; will retry")
             finally:
-                try:
-                    if self.file_r:
-                        self.file_r.close()
-                except Exception:
-                    pass
-                try:
-                    if self.file_w:
-                        self.file_w.close()
-                except Exception:
-                    pass
-                try:
-                    if self.sock:
-                        self.sock.close()
-                except Exception:
-                    pass
-                self.file_r = self.file_w = None
-                self.sock = None
-                self._prebuffer = b""
-                if was_connected:
-                    self.incoming.put({"type": "net_status", "status": "disconnected"})
-                # Avoid 'break' inside finally (SyntaxWarning in newer Python);
-                # only sleep/backoff when we are not stopping.
-                if not self.stop_event.is_set():
-                    time.sleep(min(5.0, backoff))
-                    backoff = min(5.0, backoff * 1.5)
+                backoff = self._cleanup_connection(was_connected, backoff)
         # Exit
         self.incoming.put({"type": "disconnected"})
+
+    def _wait_for_blocking_line(self, remaining: float) -> bool:
+        try:
+            if self._pending_bytes() > 0:
+                return True
+            rlist, _, _ = select.select([self.sock], [], [], remaining)
+            return bool(rlist)
+        except Exception:
+            return True
+
+    def _recv_blocking_line_chunk(self) -> Tuple[Optional[bytes], bool]:
+        try:
+            return self.sock.recv(4096), False
+        except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            return b"", True
+        except Exception:
+            return None, False
+
+    def _buffer_within_limit(self, log, payload: bytes, *, label: str) -> bool:
+        try:
+            if self._max_frame_bytes and len(payload) > self._max_frame_bytes:
+                log.error("Incoming %s exceeds max size (%s bytes); closing", label, self._max_frame_bytes)
+                return False
+        except Exception:
+            return False
+        return True
+
+    def _extract_blocking_line(self, log, buffer: bytes) -> Optional[bytes]:
+        if not self._buffer_within_limit(log, buffer, label="frame"):
+            return b""
+        if b"\n" not in buffer:
+            return None
+        line, rest = buffer.split(b"\n", 1)
+        self._prebuffer = rest
+        if not self._buffer_within_limit(log, line, label="line"):
+            return b""
+        return line
 
     def _read_line_blocking(self, timeout: float = 5.0) -> Optional[bytes]:
         log = logging.getLogger('client.net')
@@ -4282,44 +4379,20 @@ class NetworkClient(threading.Thread):
         buf = b""
         while time.time() < deadline and not self.stop_event.is_set():
             remaining = max(0.0, deadline - time.time())
-            try:
-                pending = 0
-                try:
-                    if hasattr(self.sock, "pending"):
-                        pending = int(getattr(self.sock, "pending")())  # type: ignore[misc]
-                except Exception:
-                    pending = 0
-                if pending <= 0:
-                    rlist, _, _ = select.select([self.sock], [], [], remaining)
-                    if not rlist:
-                        continue
-            except Exception:
-                pass
-            try:
-                chunk = self.sock.recv(4096)
-            except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            if not self._wait_for_blocking_line(remaining):
                 continue
-            except Exception:
+            chunk, retry = self._recv_blocking_line_chunk()
+            if retry:
+                continue
+            if chunk is None:
                 break
             if not chunk:
-                # closed by peer
                 break
             buf += chunk
-            try:
-                if self._max_frame_bytes and len(buf) > self._max_frame_bytes:
-                    log.error("Incoming frame exceeds max size (%s bytes); closing", self._max_frame_bytes)
-                    return None
-            except Exception:
+            line = self._extract_blocking_line(log, buf)
+            if line == b"":
                 return None
-            if b"\n" in buf:
-                line, rest = buf.split(b"\n", 1)
-                self._prebuffer = rest
-                try:
-                    if self._max_frame_bytes and len(line) > self._max_frame_bytes:
-                        log.error("Incoming line exceeds max size (%s bytes); closing", self._max_frame_bytes)
-                        return None
-                except Exception:
-                    return None
+            if line is not None:
                 return line
         log.debug("_read_line_blocking timeout or closed; got=%r", buf[:200])
         return buf if buf else None
@@ -4354,13 +4427,30 @@ def wrap_text(text: str, width: int) -> List[str]:
     return lines
 
 
+def _skip_history_request(chan: object) -> bool:
+    if not isinstance(chan, str) or not chan:
+        return True
+    return chan.startswith('BINV:') or chan.startswith('GINV:') or chan.startswith('JOIN:')
+
+
+def _history_payload_for_channel(state, chan: str) -> dict:
+    try:
+        since = int(getattr(state, 'history_last_ids', {}).get(chan, 0))
+    except Exception:
+        since = 0
+    room_like = (chan in getattr(state, 'groups', {})) or (chan in getattr(state, 'boards', {})) or chan.startswith('b-')
+    if room_like:
+        return {"type": "history", "room": chan, "since_id": since}
+    return {"type": "history", "peer": chan, "since_id": since}
+
+
 def request_history_if_needed(state, net, chan: Optional[str], force: bool = False) -> None:
     """Fetch history for channel/peer.
 
     - force=True: always request using last known id (default 0).
     - force=False: request only when нет локальной переписки.
     """
-    if not chan or not isinstance(chan, str) or chan.startswith('BINV:') or chan.startswith('GINV:') or chan.startswith('JOIN:'):
+    if _skip_history_request(chan):
         return
     try:
         if chan in getattr(state, 'history_fetching', set()):
@@ -4369,15 +4459,7 @@ def request_history_if_needed(state, net, chan: Optional[str], force: bool = Fal
             conv = state.conversations.get(chan, [])
             if conv:
                 return
-        # Room vs peer
-        try:
-            since = int(getattr(state, 'history_last_ids', {}).get(chan, 0))
-        except Exception:
-            since = 0
-        if (chan in getattr(state, 'groups', {})) or (chan in getattr(state, 'boards', {})) or chan.startswith('b-'):
-            net.send({"type": "history", "room": chan, "since_id": since})
-        else:
-            net.send({"type": "history", "peer": chan, "since_id": since})
+        net.send(_history_payload_for_channel(state, chan))
         try:
             state.history_fetching.add(chan)
         except Exception:
@@ -4440,6 +4522,21 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
+def _capture_screen_row(stdscr, y: int, width: int, encoding: str) -> str:
+    raw = b""
+    for attempt in (max(1, int(width)), max(1, int(width) - 1), None):
+        try:
+            raw = stdscr.instr(y, 0, attempt) if attempt is not None else stdscr.instr(y, 0)
+            break
+        except Exception:
+            raw = b""
+    try:
+        text = raw.decode(encoding, errors="replace") if isinstance(raw, bytes) else str(raw)
+    except Exception:
+        text = str(raw) if raw else ""
+    return text.replace("\x00", "").rstrip()
+
+
 def capture_screen_text(stdscr) -> str:
     """Capture the currently visible curses screen as plain text."""
     try:
@@ -4449,29 +4546,7 @@ def capture_screen_text(stdscr) -> str:
     encoding = locale.getpreferredencoding(False) or "utf-8"
     lines: List[str] = []
     for y in range(max(0, int(h))):
-        raw = b""
-        try:
-            raw = stdscr.instr(y, 0, max(1, int(w)))
-        except Exception:
-            try:
-                raw = stdscr.instr(y, 0, max(1, int(w) - 1))
-            except Exception:
-                try:
-                    raw = stdscr.instr(y, 0)
-                except Exception:
-                    raw = b""
-        try:
-            if isinstance(raw, bytes):
-                s = raw.decode(encoding, errors="replace")
-            else:
-                s = str(raw)
-        except Exception:
-            try:
-                s = str(raw)
-            except Exception:
-                s = ""
-        s = s.replace("\x00", "")
-        lines.append(s.rstrip())
+        lines.append(_capture_screen_row(stdscr, y, int(w), encoding))
     return "\n".join(lines).rstrip()
 
 
@@ -4494,68 +4569,107 @@ def copy_screen_to_clipboard(stdscr) -> Tuple[bool, Optional[Path]]:
         return False, None
 
 
-def extract_selection_text(state: object, end_y: Optional[int] = None, end_x: Optional[int] = None) -> str:
-    """Extract selected text from the last drawn history window.
-
-    Uses state.sel_anchor_*, state.sel_cur_* and state.last_hist_*.
-    Selection is clamped to the visible history area.
-    """
+def _selection_history_geometry(state: object) -> Optional[Tuple[int, int, int, int]]:
     try:
         hist_y = int(getattr(state, 'last_hist_y', 0))
         hist_x = int(getattr(state, 'last_hist_x', 0))
         hist_h = int(getattr(state, 'last_hist_h', 0))
         hist_w = int(getattr(state, 'last_hist_w', 0))
     except Exception:
-        return ""
+        return None
     if hist_h <= 0 or hist_w <= 0:
-        return ""
+        return None
+    return hist_y, hist_x, hist_h, hist_w
+
+
+def _selection_anchor_and_cursor(
+    state: object,
+    hist_y: int,
+    hist_x: int,
+    end_y: Optional[int],
+    end_x: Optional[int],
+) -> Tuple[int, int, int, int]:
     try:
-        ay = int(getattr(state, 'sel_anchor_y', hist_y))
-        ax = int(getattr(state, 'sel_anchor_x', hist_x))
+        anchor_y = int(getattr(state, 'sel_anchor_y', hist_y))
+        anchor_x = int(getattr(state, 'sel_anchor_x', hist_x))
     except Exception:
-        ay, ax = hist_y, hist_x
+        anchor_y, anchor_x = hist_y, hist_x
     try:
-        cy = int(end_y if end_y is not None else getattr(state, 'sel_cur_y', ay))
-        cx = int(end_x if end_x is not None else getattr(state, 'sel_cur_x', ax))
+        cursor_y = int(end_y if end_y is not None else getattr(state, 'sel_cur_y', anchor_y))
+        cursor_x = int(end_x if end_x is not None else getattr(state, 'sel_cur_x', anchor_x))
     except Exception:
-        cy, cx = ay, ax
-    y0, y1 = sorted([ay, cy])
-    x0, x1 = sorted([ax, cx])
-    # Clamp to history area
+        cursor_y, cursor_x = anchor_y, anchor_x
+    return anchor_y, anchor_x, cursor_y, cursor_x
+
+
+def _clamped_selection_bounds(
+    hist_y: int,
+    hist_x: int,
+    hist_h: int,
+    hist_w: int,
+    anchor_y: int,
+    anchor_x: int,
+    cursor_y: int,
+    cursor_x: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    y0, y1 = sorted([anchor_y, cursor_y])
+    x0, x1 = sorted([anchor_x, cursor_x])
     y0 = max(y0, hist_y)
     y1 = min(y1, hist_y + hist_h - 1)
     x0 = max(x0, hist_x)
     x1 = min(x1, hist_x + hist_w - 1)
     if y0 > y1 or x0 > x1:
-        return ""
-    # Single cell -> whole line (matches mouse behavior)
+        return None
     if y0 == y1 and x0 == x1:
-        x0 = hist_x
-        x1 = hist_x + hist_w - 1
+        return hist_x, hist_x + hist_w - 1, y0, y1
+    return x0, x1, y0, y1
+
+
+def _selection_columns_for_row(sy: int, y0: int, y1: int, x0: int, x1: int, hist_x: int, hist_w: int) -> Tuple[int, int]:
+    if sy == y0 and sy == y1:
+        return max(0, x0 - hist_x), min(hist_w, x1 - hist_x + 1)
+    if sy == y0:
+        return max(0, x0 - hist_x), hist_w
+    if sy == y1:
+        return 0, min(hist_w, x1 - hist_x + 1)
+    return 0, hist_w
+
+
+def _history_line_text(last_lines: List[object], hist_y: int, sy: int) -> Optional[str]:
+    idx = sy - hist_y
+    if idx < 0 or idx >= len(last_lines):
+        return None
+    line_obj = last_lines[idx]
+    return "".join(line_obj) if isinstance(line_obj, list) else str(line_obj)
+
+
+def extract_selection_text(state: object, end_y: Optional[int] = None, end_x: Optional[int] = None) -> str:
+    """Extract selected text from the last drawn history window.
+
+    Uses state.sel_anchor_*, state.sel_cur_* and state.last_hist_*.
+    Selection is clamped to the visible history area.
+    """
+    geometry = _selection_history_geometry(state)
+    if geometry is None:
+        return ""
+    hist_y, hist_x, hist_h, hist_w = geometry
+    anchor_y, anchor_x, cursor_y, cursor_x = _selection_anchor_and_cursor(state, hist_y, hist_x, end_y, end_x)
+    bounds = _clamped_selection_bounds(hist_y, hist_x, hist_h, hist_w, anchor_y, anchor_x, cursor_y, cursor_x)
+    if bounds is None:
+        return ""
+    x0, x1, y0, y1 = bounds
     try:
         last_lines = list(getattr(state, 'last_lines', []) or [])
     except Exception:
         last_lines = []
     selection_lines: List[str] = []
     for sy in range(y0, y1 + 1):
-        idx = sy - hist_y
-        if 0 <= idx < len(last_lines):
-            line_obj = last_lines[idx]
-            line = "".join(line_obj) if isinstance(line_obj, list) else str(line_obj)
-            if sy == y0 and sy == y1:
-                c0 = max(0, x0 - hist_x)
-                c1 = min(hist_w, x1 - hist_x + 1)
-            elif sy == y0:
-                c0 = max(0, x0 - hist_x)
-                c1 = hist_w
-            elif sy == y1:
-                c0 = 0
-                c1 = min(hist_w, x1 - hist_x + 1)
-            else:
-                c0 = 0
-                c1 = hist_w
-            if c0 < c1:
-                selection_lines.append(line[c0:c1].rstrip())
+        line = _history_line_text(last_lines, hist_y, sy)
+        if line is None:
+            continue
+        c0, c1 = _selection_columns_for_row(sy, y0, y1, x0, x1, hist_x, hist_w)
+        if c0 < c1:
+            selection_lines.append(line[c0:c1].rstrip())
     return "\n".join(selection_lines).rstrip("\n")
 
 
@@ -4587,6 +4701,169 @@ def _touch_contact_rows(state: ClientState) -> None:
         pass
 
 
+def _cached_contact_rows(state: ClientState) -> Optional[List[str]]:
+    try:
+        rev = int(getattr(state, '_contact_rows_rev', 0))
+        cache_rev = int(getattr(state, '_contact_rows_cache_rev', -1))
+        cached = getattr(state, '_contact_rows_cache', None)
+        if cache_rev == rev and isinstance(cached, list):
+            return cached
+    except Exception:
+        pass
+    return None
+
+
+def _search_contact_ids(state: ClientState) -> List[str]:
+    if not getattr(state, 'search_mode', False):
+        return []
+    try:
+        return [str(item.get('id')) for item in (state.search_results or []) if item and item.get('id')]
+    except Exception:
+        return []
+
+
+def _blocked_contact_ids(state: ClientState) -> Set[str]:
+    try:
+        blocked_set = set(state.blocked) | set(getattr(state, 'blocked_by', set()))
+    except Exception:
+        blocked_set = set()
+    try:
+        if state.self_id:
+            blocked_set.discard(state.self_id)
+    except Exception:
+        pass
+    return blocked_set
+
+
+def _prepend_section(rows: List[str], marker: str, values: List[str]) -> None:
+    if values:
+        rows.extend([marker] + values)
+
+
+def _board_and_group_rows(state: ClientState) -> List[str]:
+    rows: List[str] = []
+    try:
+        _prepend_section(rows, SEP9, sorted(list((getattr(state, 'boards', {}) or {}).keys())))
+    except Exception:
+        pass
+    try:
+        _prepend_section(rows, SEP5, sorted(list((getattr(state, 'groups', {}) or {}).keys())))
+    except Exception:
+        pass
+    return rows
+
+
+def _join_request_rows(state: ClientState) -> List[str]:
+    try:
+        group_join_requests = getattr(state, 'group_join_requests', {}) or {}
+        join_tokens = [
+            f"JOIN:{gid}:{uid}"
+            for gid, reqs in group_join_requests.items()
+            for uid in list(reqs or set())
+        ]
+    except Exception:
+        join_tokens = []
+    return [SEP8] + join_tokens if join_tokens else []
+
+
+def _roster_friend_rows(state: ClientState, search_ids: Set[str], blocked_set: Set[str]) -> List[str]:
+    roster = getattr(state, 'roster_friends', {}) or {}
+    if not roster:
+        return []
+    online = sorted([
+        fid for fid, info in roster.items()
+        if info.get('online') and fid != state.self_id and fid not in search_ids and fid not in blocked_set
+    ])
+    offline = sorted([
+        fid for fid, info in roster.items()
+        if (not info.get('online')) and fid != state.self_id and fid not in search_ids and fid not in blocked_set
+    ])
+    rows: List[str] = []
+    _prepend_section(rows, SEP6, online)
+    _prepend_section(rows, SEP2, offline)
+    return rows
+
+
+def _fallback_friend_rows(state: ClientState, search_ids: Set[str], blocked_set: Set[str]) -> List[str]:
+    friends_ids = set((getattr(state, 'friends', {}) or {}).keys())
+    friends_ids -= search_ids
+    friends_ids -= blocked_set
+    if not friends_ids:
+        return []
+    online_list = sorted([fid for fid in friends_ids if fid != state.self_id and state.statuses.get(fid)])
+    offline_list = sorted([fid for fid in friends_ids if fid != state.self_id and not state.statuses.get(fid)])
+    rows: List[str] = []
+    _prepend_section(rows, SEP6, online_list)
+    _prepend_section(rows, SEP2, offline_list)
+    return rows
+
+
+def _roster_friend_ids(state: ClientState) -> Set[str]:
+    try:
+        return set((getattr(state, 'roster_friends', {}) or {}).keys())
+    except Exception:
+        return set()
+
+
+def _filter_search_mode(values: List[str], search_ids: Set[str], search_mode: bool) -> List[str]:
+    if not search_mode:
+        return values
+    return [value for value in values if value not in search_ids]
+
+
+def _pending_invite_tokens(state: ClientState, attr: str, prefix: str) -> List[str]:
+    try:
+        return [f"{prefix}:{item_id}" for item_id in sorted((getattr(state, attr, {}) or {}).keys())]
+    except Exception:
+        return []
+
+
+def _pending_contact_rows(state: ClientState, search_ids: Set[str], blocked_set: Set[str]) -> List[str]:
+    try:
+        pending_in = set(state.pending_requests)
+    except Exception:
+        pending_in = set()
+    try:
+        pending_out = set(state.pending_out)
+    except Exception:
+        pending_out = set()
+    try:
+        pending_out -= pending_in
+    except Exception:
+        pass
+    roster_ids = _roster_friend_ids(state)
+    self_ids = {state.self_id or ''}
+    incoming = sorted(list(pending_in - roster_ids - self_ids - blocked_set))
+    outgoing = sorted(list(pending_out - roster_ids - self_ids - blocked_set))
+    incoming = _filter_search_mode(incoming, search_ids, bool(getattr(state, 'search_mode', False)))
+    outgoing = _filter_search_mode(outgoing, search_ids, bool(getattr(state, 'search_mode', False)))
+    invite_tokens = _pending_invite_tokens(state, 'board_pending_invites', 'BINV')
+    invite_tokens += _pending_invite_tokens(state, 'group_pending_invites', 'GINV')
+    rows: List[str] = []
+    _prepend_section(rows, SEP3, incoming)
+    if outgoing or invite_tokens:
+        rows.extend([SEP4] + outgoing + invite_tokens)
+    return rows
+
+
+def _blocked_rows(state: ClientState, search_ids: Set[str], blocked_set: Set[str]) -> List[str]:
+    try:
+        hidden_blk = set(getattr(state, 'hidden_blocked', set()))
+    except Exception:
+        hidden_blk = set()
+    blocked_list = sorted([item for item in blocked_set if item not in hidden_blk])
+    blocked_list = _filter_search_mode(blocked_list, search_ids, bool(getattr(state, 'search_mode', False)))
+    return [SEP7] + blocked_list if blocked_list else []
+
+
+def _store_contact_rows_cache(state: ClientState, rows: List[str]) -> None:
+    try:
+        state._contact_rows_cache = rows
+        state._contact_rows_cache_rev = int(getattr(state, '_contact_rows_rev', 0))
+    except Exception:
+        pass
+
+
 def build_contact_rows(state: ClientState) -> List[str]:
     """Build rows for the left contacts panel.
 
@@ -4598,139 +4875,151 @@ def build_contact_rows(state: ClientState) -> List[str]:
     - SEP4, pending outgoing...
     In search mode: IDs only.
     """
-    # Hot path: avoid rebuilding/sorting the entire contacts list on every UI tick.
-    try:
-        rev = int(getattr(state, '_contact_rows_rev', 0))
-        cache_rev = int(getattr(state, '_contact_rows_cache_rev', -1))
-        cached = getattr(state, '_contact_rows_cache', None)
-        if cache_rev == rev and isinstance(cached, list):
-            return cached
-    except Exception:
-        pass
-    # Only show authorized contacts (friends) and groups, plus unauthorized sections.
-    # When search is active, prepend a "Поиск" group with results but keep the regular list visible.
+    cached = _cached_contact_rows(state)
+    if cached is not None:
+        return cached
     rows: List[str] = []
-    search_ids: List[str] = []
-    if state.search_mode:
-        try:
-            search_ids = [str(item.get('id')) for item in (state.search_results or []) if item and item.get('id')]
-        except Exception:
-            search_ids = []
-        if search_ids:
-            rows += [SEP1] + search_ids
-    # Compute blocked union (both directions)
-    try:
-        blocked_set = set(state.blocked) | set(getattr(state, 'blocked_by', set()))
-    except Exception:
-        blocked_set = set()
-    # Do not include self id
-    try:
-        if state.self_id:
-            blocked_set.discard(state.self_id)
-    except Exception:
-        pass
-
-    # Boards (if any)
-    try:
-        if getattr(state, 'boards', {}):
-            rows += [SEP9] + sorted(list(state.boards.keys()))
-    except Exception:
-        pass
-    # Groups (if any)
-    try:
-        if state.groups:
-            rows += [SEP5] + sorted(list(state.groups.keys()))
-    except Exception:
-        pass
-    # Pending group join requests (owner only; entries as JOIN:<gid>:<uid>)
-    try:
-        gj = getattr(state, 'group_join_requests', {}) or {}
-        join_tokens: List[str] = []
-        for gid, reqs in gj.items():
-            for uid in list(reqs or set()):
-                join_tokens.append(f"JOIN:{gid}:{uid}")
-        if join_tokens:
-            rows += [SEP8] + join_tokens
-    except Exception:
-        pass
-    # Primary source: server-provided friends roster
-    if state.roster_friends:
-        exclude = set(search_ids) if state.search_mode else set()
-        online = sorted([fid for fid, info in state.roster_friends.items() if info.get('online') and fid != state.self_id and fid not in exclude and fid not in blocked_set])
-        offline = sorted([fid for fid, info in state.roster_friends.items() if not info.get('online') and fid != state.self_id and fid not in exclude and fid not in blocked_set])
-        if online:
-            rows += [SEP6] + online
-        if offline:
-            rows += [SEP2] + offline
+    search_ids = _search_contact_ids(state)
+    search_ids_set = set(search_ids)
+    if search_ids:
+        rows.extend([SEP1] + search_ids)
+    blocked_set = _blocked_contact_ids(state)
+    rows.extend(_board_and_group_rows(state))
+    rows.extend(_join_request_rows(state))
+    if getattr(state, 'roster_friends', {}):
+        rows.extend(_roster_friend_rows(state, search_ids_set, blocked_set))
     else:
-        # Strict fallback: show only known friends (if we have them); otherwise don't show online snapshot of everyone
-        friends_ids = set(state.friends.keys())
-        if state.search_mode:
-            friends_ids -= set(search_ids)
-        if friends_ids:
-            friends_ids = friends_ids - blocked_set
-            online_list = sorted([fid for fid in friends_ids if fid != state.self_id and state.statuses.get(fid)])
-            offline_list = sorted([fid for fid in friends_ids if fid != state.self_id and not state.statuses.get(fid)])
-            if online_list:
-                rows += [SEP6] + online_list
-            if offline_list:
-                rows += [SEP2] + offline_list
-    # Append unauthorized users group (pending in/out), excluding already friends
-    try:
-        pending_in = set(state.pending_requests)
-    except Exception:
-        pending_in = set()
-    try:
-        pending_out = set(state.pending_out)
-    except Exception:
-        pending_out = set()
-    # Если контакт одновременно в входящих и исходящих — отдаём приоритет входящим
-    # (чтобы можно было сразу авторизовать). Исключаем пересечение из исходящих.
-    try:
-        pending_out = pending_out - pending_in
-    except Exception:
-        pass
-    # Incoming requests (Неавторизованные)
-    unauth_in = sorted(list(pending_in - set(state.roster_friends.keys()) - {state.self_id or ''} - blocked_set))
-    if state.search_mode:
-        unauth_in = [x for x in unauth_in if x not in set(search_ids)]
-    if unauth_in:
-        rows += [SEP3] + unauth_in
-    # Outgoing requests (Ждут авторизации) + pending board/group invites
-    unauth_out = sorted(list(pending_out - set(state.roster_friends.keys()) - {state.self_id or ''} - blocked_set))
-    if state.search_mode:
-        unauth_out = [x for x in unauth_out if x not in set(search_ids)]
-    try:
-        binv_tokens = [f"BINV:{bid}" for bid in sorted((getattr(state, 'board_pending_invites', {}) or {}).keys())]
-    except Exception:
-        binv_tokens = []
-    try:
-        ginv_tokens = [f"GINV:{gid}" for gid in sorted((getattr(state, 'group_pending_invites', {}) or {}).keys())]
-    except Exception:
-        ginv_tokens = []
-    if unauth_out or binv_tokens or ginv_tokens:
-        rows += [SEP4] + unauth_out + binv_tokens + ginv_tokens
-
-    # Blocked section (both blocked and blocked_by)
-    try:
-        hidden_blk = set(getattr(state, 'hidden_blocked', set()))
-    except Exception:
-        hidden_blk = set()
-    blocked_list = sorted([x for x in list(blocked_set) if x not in hidden_blk])
-    if state.search_mode:
-        blocked_list = [x for x in blocked_list if x not in set(search_ids)]
-    if blocked_list:
-        rows += [SEP7] + blocked_list
-    try:
-        state._contact_rows_cache = rows
-        state._contact_rows_cache_rev = int(getattr(state, '_contact_rows_rev', 0))
-    except Exception:
-        pass
+        rows.extend(_fallback_friend_rows(state, search_ids_set, blocked_set))
+    rows.extend(_pending_contact_rows(state, search_ids_set, blocked_set))
+    rows.extend(_blocked_rows(state, search_ids_set, blocked_set))
+    _store_contact_rows_cache(state, rows)
     return rows
 
 
 def is_separator(token: Optional[str]) -> bool:
     return token in (SEP1, SEP2, SEP3, SEP4, SEP5, SEP6, SEP7, SEP8, SEP9)
+
+
+def _known_relation_ids(state: "ClientState") -> Set[str]:
+    return (
+        set(state.friends.keys())
+        | set(state.roster_friends.keys())
+        | set(state.pending_requests)
+        | set(state.pending_out)
+        | set(state.blocked)
+    )
+
+
+def _profile_id_for_handle(state: "ClientState", handle: str) -> Optional[str]:
+    for profile_id, profile in (state.profiles or {}).items():
+        try:
+            if (profile or {}).get('handle') == handle:
+                return profile_id
+        except Exception:
+            pass
+    return None
+
+
+def _relation_label_for_id(state: "ClientState", related_id: str) -> str:
+    if related_id in state.blocked:
+        return 'blocked'
+    if (related_id in state.friends) or (related_id in state.roster_friends):
+        return 'friend'
+    if related_id in state.pending_requests:
+        return 'incoming'
+    if related_id in state.pending_out:
+        return 'outgoing'
+    return 'known'
+
+
+def _local_relation_for_query(state: "ClientState", query: str) -> Optional[Tuple[str, str]]:
+    related_id = None
+    if query and not query.startswith('@'):
+        if query in _known_relation_ids(state):
+            related_id = query
+    if related_id is None and query.startswith('@'):
+        related_id = _profile_id_for_handle(state, query)
+    if not related_id:
+        return None
+    return related_id, _relation_label_for_id(state, related_id)
+
+
+def _append_debug_line(state: "ClientState", message: str) -> None:
+    try:
+        state.debug_lines.append(message)
+        if len(state.debug_lines) > 300:
+            del state.debug_lines[:len(state.debug_lines) - 300]
+    except Exception:
+        pass
+
+
+def _run_selftest_update(state: "ClientState") -> None:
+    base = _get_update_base_url()
+    if not base:
+        _append_debug_line(state, "[selftest:update] UPDATE_URL не задан")
+        return
+    manifest = _load_manifest(base, timeout=4.0)
+    if not manifest:
+        _append_debug_line(state, "[selftest:update] не удалось загрузить manifest")
+        return
+    entries = _safe_manifest_entries(manifest)
+    _append_debug_line(state, f"[selftest:update] manifest ok version={manifest.get('version')} files={len(entries)}")
+
+
+def _run_selftest_file(state: "ClientState") -> None:
+    try:
+        tmp_dir = FILES_DIR / "selftest"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = tmp_dir / "probe.txt"
+        tmp_path.write_text("selftest-file-payload", encoding='utf-8')
+        _append_debug_line(state, f"[selftest:file] подготовлен файл {tmp_path} size={tmp_path.stat().st_size}")
+    except Exception as exc:
+        _append_debug_line(state, f"[selftest:file] ошибка подготовки файла: {exc}")
+
+
+def _run_selftest_reg(state: "ClientState", net) -> None:
+    try:
+        rid = "selftest-" + str(int(time.time()))
+        payload = {"type": "register", "id": rid, "password": "testpw"}
+        state.selftest_reg = True
+        state.selftest_reg_pw = "testpw"
+        net.send(payload)
+        _append_debug_line(state, f"[selftest:reg] отправлен запрос: {payload}")
+    except Exception as exc:
+        _append_debug_line(state, f"[selftest:reg] ошибка отправки: {exc}")
+
+
+def _run_selftest_command(state: "ClientState", net, mode: str) -> None:
+    handlers = {
+        'update': lambda: _run_selftest_update(state),
+        'file': lambda: _run_selftest_file(state),
+        'reg': lambda: _run_selftest_reg(state, net),
+    }
+    if mode not in handlers:
+        state.status = "Используйте: /selftest update|file|reg"
+        return
+    state.status = f"Selftest {mode}..."
+    _append_debug_line(state, f"[selftest] start {mode}")
+    try:
+        handlers[mode]()
+    except Exception as exc:
+        _append_debug_line(state, f"[selftest] ошибка: {exc}")
+
+
+def _bounded_selected_index(state: ClientState, rows: List[str]) -> None:
+    if state.selected_index >= len(rows):
+        state.selected_index = max(0, len(rows) - 1)
+    if state.selected_index < 0:
+        state.selected_index = 0
+
+
+def _seek_non_separator(rows: List[str], start: int, step: int) -> Optional[int]:
+    idx = start
+    while 0 <= idx < len(rows):
+        if not is_separator(rows[idx]):
+            return idx
+        idx += step
+    return None
 
 
 def clamp_selection(state: ClientState, prefer: str = 'down', rows: Optional[List[str]] = None) -> None:
@@ -4745,39 +5034,15 @@ def clamp_selection(state: ClientState, prefer: str = 'down', rows: Optional[Lis
     if not rows:
         state.selected_index = 0
         return
-    # Bound
-    if state.selected_index >= len(rows):
-        state.selected_index = max(0, len(rows) - 1)
-    if state.selected_index < 0:
-        state.selected_index = 0
-    # Skip separators
-    if is_separator(rows[state.selected_index]):
-        if prefer == 'up':
-            # try move up first
-            i = state.selected_index
-            while i >= 0 and is_separator(rows[i]):
-                i -= 1
-            if i >= 0:
-                state.selected_index = i
-            else:
-                # then move down
-                i = state.selected_index
-                while i < len(rows) and is_separator(rows[i]):
-                    i += 1
-                state.selected_index = min(i, len(rows) - 1)
-        else:
-            # try move down first (default behavior)
-            i = state.selected_index
-            while i < len(rows) and is_separator(rows[i]):
-                i += 1
-            if i < len(rows):
-                state.selected_index = i
-            else:
-                # move up
-                i = state.selected_index
-                while i >= 0 and is_separator(rows[i]):
-                    i -= 1
-                state.selected_index = max(0, i)
+    _bounded_selected_index(state, rows)
+    if not is_separator(rows[state.selected_index]):
+        return
+    primary = _seek_non_separator(rows, state.selected_index, -1 if prefer == 'up' else 1)
+    if primary is not None:
+        state.selected_index = primary
+        return
+    fallback = _seek_non_separator(rows, state.selected_index, 1 if prefer == 'up' else -1)
+    state.selected_index = max(0, fallback or 0)
 
 
 def current_selected_id(state: ClientState, rows: Optional[List[str]] = None) -> Optional[str]:
@@ -4792,12 +5057,8 @@ def current_selected_id(state: ClientState, rows: Optional[List[str]] = None) ->
         return None
     return tok
 
-def open_actions_menu_for_selection(state: ClientState, net) -> None:
-    """Open the same actions menu as on KEY_LEFT for the current selection.
 
-    This helper is used by both keyboard (LEFT) and mouse right-click handlers.
-    """
-    # Close conflicting overlays
+def _clear_action_menu_overlays(state: ClientState) -> None:
     try:
         state.search_action_mode = False
         state.profile_view_mode = False
@@ -4806,122 +5067,144 @@ def open_actions_menu_for_selection(state: ClientState, net) -> None:
         state.help_mode = False
     except Exception:
         pass
-    sel = current_selected_id(state)
-    # If selection is on a separator (None) and there are pending requests only, pick first pending for menu
+
+
+def _fallback_pending_request_selection(state: ClientState, sel: Optional[str]) -> Optional[str]:
+    if sel is not None:
+        return sel
     try:
-        if (sel is None) and state.pending_requests:
-            rows = build_contact_rows(state)
-            for tok in rows:
-                if (not is_separator(tok)) and (tok in state.pending_requests):
-                    sel = tok
-                    break
+        pending = getattr(state, 'pending_requests', None) or []
+        if not pending:
+            return None
+        for tok in build_contact_rows(state):
+            if (not is_separator(tok)) and (tok in pending):
+                return tok
     except Exception:
         pass
-    # JOIN token (group join request)
-    if sel and isinstance(sel, str) and sel.startswith('JOIN:'):
-        try:
-            _, gid, rid = sel.split(':', 2)
-        except Exception:
-            gid, rid = '', ''
-        options = ["Принять в чат", "Отклонить", "Профиль пользователя", "Профиль чата"]
-        state.action_menu_mode = True
-        state.action_menu_peer = sel
-        state.action_menu_options = options
-        state.action_menu_index = 0
+    return sel
+
+
+def _set_action_menu_state(state: ClientState, peer: str, options: List[str]) -> None:
+    if not options:
         return
-    # Group actions
-    if sel and (sel in state.groups):
-        g = state.groups.get(sel) or {}
-        is_owner = (str(g.get('owner_id') or '') == str(state.self_id or ''))
-        options: List[str] = []
-        try:
-            members = set(g.get('members') or [])
-            is_member = (str(state.self_id or '') in members) if members else True
-        except Exception:
-            is_member = True
-        if is_member:
-            options.append("Отправить файл")
-        # Просмотр участников доступен всем (и членам, и владельцу)
-        options.append("Участники")
-        if is_owner:
-            options.append("Добавить участника")
-            options.append("Удалить участника")
-            options.append("Рассформировать чат")
-            try:
-                net.send({"type": "group_info", "group_id": sel})
-            except Exception:
-                pass
-        else:
-            options.append("Профиль чата")
-        try:
-            muted = sel in getattr(state, 'group_muted', set())
-            options.append("Включить уведомления" if muted else "Заглушить чат")
-        except Exception:
-            options.append("Заглушить чат")
-        if options:
-            state.action_menu_mode = True
-            state.action_menu_peer = sel
-            state.action_menu_options = options
-            state.action_menu_index = 0
-        return
-    # Board actions
-    if sel and (sel in getattr(state, 'boards', {})):
-        b = (getattr(state, 'boards', {}) or {}).get(sel) or {}
-        is_owner = (str(b.get('owner_id') or '') == str(state.self_id or ''))
-        options: List[str] = []
-        if is_owner:
-            options.append("Отправить файл")
-        if not is_owner:
-            try:
-                muted = sel in getattr(state, 'board_muted', set())
-                options.append("Включить уведомления" if muted else "Заглушить доску")
-            except Exception:
-                options.append("Заглушить доску")
-        options.append("Участники")
-        options.append("Добавить участника")
-        options.append("Удалить участника")
-        if is_owner:
-            options.append("Рассформировать доску")
-        else:
-            options.append("Покинуть доску")
-        state.action_menu_mode = True
-        state.action_menu_peer = sel
-        state.action_menu_options = options
-        state.action_menu_index = 0
-        return
-    # Direct/user actions
-    if sel:
-        options: List[str] = []
-        # FILE allowed for friends (server authoritative anyway)
+    state.action_menu_mode = True
+    state.action_menu_peer = peer
+    state.action_menu_options = options
+    state.action_menu_index = 0
+
+
+def _join_action_menu_options(sel: Optional[str]) -> Optional[List[str]]:
+    if not (sel and isinstance(sel, str) and sel.startswith('JOIN:')):
+        return None
+    return ["Принять в чат", "Отклонить", "Профиль пользователя", "Профиль чата"]
+
+
+def _group_is_owner(state: ClientState, group: dict) -> bool:
+    return str(group.get('owner_id') or '') == str(state.self_id or '')
+
+
+def _group_is_member(state: ClientState, group: dict) -> bool:
+    try:
+        members = set(group.get('members') or [])
+    except Exception:
+        members = set()
+    return (str(state.self_id or '') in members) if members else True
+
+
+def _mute_label(container, muted_attr: str, peer: str, on_label: str, off_label: str) -> str:
+    try:
+        muted = peer in getattr(container, muted_attr, set())
+        return on_label if muted else off_label
+    except Exception:
+        return off_label
+
+
+def _group_action_menu_options(state: ClientState, sel: Optional[str], net) -> Optional[List[str]]:
+    if not (sel and sel in getattr(state, 'groups', {})):
+        return None
+    group = state.groups.get(sel) or {}
+    options: List[str] = []
+    if _group_is_member(state, group):
         options.append("Отправить файл")
-        options.append("Удалить из контактов")
-        options.append("Очистить чат")
+    options.append("Участники")
+    if _group_is_owner(state, group):
+        options.extend(["Добавить участника", "Удалить участника", "Рассформировать чат"])
         try:
-            options.append("Снять заглушку" if sel in state.muted else "Заглушить")
-        except Exception:
-            options.append("Заглушить")
-        try:
-            options.append("Разблокировать" if sel in state.blocked else "Заблокировать")
-        except Exception:
-            options.append("Заблокировать")
-        # Authorization related
-        try:
-            if sel in (state.pending_requests or []):
-                options.append("Авторизовать")
-                options.append("Отклонить")
-                options.append("Заблокировать")
-            elif sel in (state.pending_out or set()):
-                options.append("Отменить запрос")
-                options.append("Заблокировать")
-            else:
-                options.append("Запросить авторизацию")
+            net.send({"type": "group_info", "group_id": sel})
         except Exception:
             pass
-        state.action_menu_mode = True
-        state.action_menu_peer = sel
-        state.action_menu_options = options
-        state.action_menu_index = 0
+    else:
+        options.append("Профиль чата")
+    options.append(_mute_label(state, 'group_muted', sel, "Включить уведомления", "Заглушить чат"))
+    return options
+
+
+def _board_action_menu_options(state: ClientState, sel: Optional[str]) -> Optional[List[str]]:
+    boards = getattr(state, 'boards', {}) or {}
+    if not (sel and sel in boards):
+        return None
+    board = boards.get(sel) or {}
+    is_owner = str(board.get('owner_id') or '') == str(state.self_id or '')
+    options: List[str] = []
+    if is_owner:
+        options.append("Отправить файл")
+    else:
+        options.append(_mute_label(state, 'board_muted', sel, "Включить уведомления", "Заглушить доску"))
+    options.extend(["Участники", "Добавить участника", "Удалить участника"])
+    options.append("Рассформировать доску" if is_owner else "Покинуть доску")
+    return options
+
+
+def _authorization_action_options(state: ClientState, sel: str) -> List[str]:
+    try:
+        if sel in (state.pending_requests or []):
+            return ["Авторизовать", "Отклонить", "Заблокировать"]
+        if sel in (state.pending_out or set()):
+            return ["Отменить запрос", "Заблокировать"]
+    except Exception:
+        return []
+    return ["Запросить авторизацию"]
+
+
+def _direct_action_menu_options(state: ClientState, sel: Optional[str]) -> Optional[List[str]]:
+    if not sel:
+        return None
+    options = [
+        "Отправить файл",
+        "Удалить из контактов",
+        "Очистить чат",
+        _mute_label(state, 'muted', sel, "Снять заглушку", "Заглушить"),
+    ]
+    try:
+        options.append("Разблокировать" if sel in state.blocked else "Заблокировать")
+    except Exception:
+        options.append("Заблокировать")
+    options.extend(_authorization_action_options(state, sel))
+    return options
+
+
+def open_actions_menu_for_selection(state: ClientState, net) -> None:
+    """Open the same actions menu as on KEY_LEFT for the current selection.
+
+    This helper is used by both keyboard (LEFT) and mouse right-click handlers.
+    """
+    _clear_action_menu_overlays(state)
+    sel = _fallback_pending_request_selection(state, current_selected_id(state))
+    options = _join_action_menu_options(sel)
+    if options and sel:
+        _set_action_menu_state(state, sel, options)
         return
+    options = _group_action_menu_options(state, sel, net)
+    if options and sel:
+        _set_action_menu_state(state, sel, options)
+        return
+    options = _board_action_menu_options(state, sel)
+    if options and sel:
+        _set_action_menu_state(state, sel, options)
+        return
+    options = _direct_action_menu_options(state, sel)
+    if options and sel:
+        _set_action_menu_state(state, sel, options)
 
 def _is_auth_actions_menu(state: ClientState) -> bool:
     try:
@@ -4955,6 +5238,342 @@ def _maybe_open_authz_actions_menu(state: ClientState, peer: Optional[str]) -> b
         return True
     except Exception:
         return False
+
+
+ZERO_WIDTH_CHARS = {"\u200d", "\u200c", "\ufeff", "\u200b", "\u200e", "\u200f", "\ufe0e", "\ufe0f"}
+
+
+def _blinking_bell_prefix() -> str:
+    try:
+        blink_on = int(time.time() * 2) % 2 == 0
+    except Exception:
+        blink_on = True
+    return "🔔 " if blink_on else "   "
+
+
+def _pending_invite_label(state: ClientState, uid: str, *, invite_attr: str) -> Optional[str]:
+    if not isinstance(uid, str) or not uid.startswith(f'{invite_attr}:'):
+        return None
+    try:
+        invite_id = uid.split(':', 1)[1]
+    except Exception:
+        invite_id = uid
+    source_attr = 'board_pending_invites' if invite_attr == 'BINV' else 'group_pending_invites'
+    meta = (getattr(state, source_attr, {}) or {}).get(invite_id, {})
+    name = str(meta.get('name') or invite_id)
+    return f"{_blinking_bell_prefix()}{name}"
+
+
+def _join_request_label(state: ClientState, uid: str) -> Optional[str]:
+    if not isinstance(uid, str) or not uid.startswith('JOIN:'):
+        return None
+    try:
+        _, group_id, requester_id = uid.split(':', 2)
+    except Exception:
+        return uid
+    group = state.groups.get(group_id) or {}
+    group_name = str(group.get('name') or group_id)
+    profile = state.profiles.get(requester_id) or {}
+    display_name = (profile.get('display_name') or '').strip()
+    handle = (profile.get('handle') or '').strip()
+    who = display_name or handle or requester_id
+    return f"⏳ Запрос в чат {group_name} от {who}"
+
+
+def _room_label(board_or_group: dict, uid: str) -> str:
+    name = str(board_or_group.get('name') or uid)
+    handle = str(board_or_group.get('handle') or '')
+    if handle and handle.startswith('@'):
+        suffix = f" [{handle[1:]}]"
+    else:
+        suffix = f" [{handle}]" if handle else ''
+    return f"# {name}{suffix}"
+
+
+def _user_contact_label(state: ClientState, uid: str) -> str:
+    profile = state.profiles.get(uid) or {}
+    display_name = (profile.get('display_name') or '').strip()
+    handle = (profile.get('handle') or '').strip()
+    online = bool(state.statuses.get(uid))
+    icon = status_icon(online)
+    if display_name:
+        base = f"{icon} {display_name}"
+        if handle:
+            base += f" ({handle})"
+        return f"{base} [{uid}]"
+    if handle:
+        return f"{icon} {handle} [{uid}]"
+    return f"{icon} {uid}"
+
+
+def contact_label_for(state: ClientState, uid: str) -> str:
+    for invite_attr in ('BINV', 'GINV'):
+        label = _pending_invite_label(state, uid, invite_attr=invite_attr)
+        if label is not None:
+            return label
+    join_label = _join_request_label(state, uid)
+    if join_label is not None:
+        return join_label
+    boards = getattr(state, 'boards', {})
+    if uid in boards:
+        return _room_label(boards.get(uid) or {}, uid)
+    if uid in state.groups:
+        return _room_label(state.groups.get(uid) or {}, uid)
+    return _user_contact_label(state, uid)
+
+
+def formatted_chars(raw: str, *, strong_attr: int, link_attr: int) -> List[Tuple[str, int]]:
+    text = raw or ""
+    out: List[Tuple[str, int]] = []
+    while text:
+        if text.startswith("**"):
+            end = text.find("**", 2)
+            if end != -1:
+                out.extend((ch, strong_attr) for ch in text[2:end])
+                text = text[end + 2:]
+                continue
+        if text.startswith("["):
+            middle = text.find("](")
+            end = text.find(")", middle + 2) if middle != -1 else -1
+            if middle != -1 and end != -1:
+                out.extend((ch, link_attr) for ch in text[1:middle])
+                text = text[end + 1:]
+                continue
+        out.append((text[0], curses.A_NORMAL))
+        text = text[1:]
+    return out
+
+
+def is_zero_width_char(ch: str) -> bool:
+    if ch in ZERO_WIDTH_CHARS:
+        return True
+    try:
+        return unicodedata.category(ch) == "Cf"
+    except Exception:
+        return False
+
+
+def char_display_width(ch: str) -> int:
+    try:
+        if is_zero_width_char(ch) or unicodedata.combining(ch):
+            return 0
+    except Exception:
+        pass
+    try:
+        return int(display_width(ch))
+    except Exception:
+        return 1
+
+
+def cells_from_string(text: str, attr: int) -> List[Tuple[str, int, int]]:
+    cells: List[Tuple[str, int, int]] = []
+    for ch in text:
+        if is_zero_width_char(ch) or unicodedata.combining(ch):
+            if cells:
+                prev_text, prev_attr, prev_width = cells[-1]
+                cells[-1] = (prev_text + ch, prev_attr, prev_width)
+            continue
+        cells.append((ch, attr, max(1, char_display_width(ch))))
+    return cells
+
+
+def flush_render_line(lines: List[str], line_attrs: List[List[int]], cells: List[Tuple[str, int, int]]) -> None:
+    if not cells:
+        return
+    render_chars: List[str] = []
+    attrs: List[int] = []
+    for text, attr, width in cells:
+        render_chars.append(text)
+        attrs.extend([attr] * max(1, width))
+        if width > 1:
+            render_chars.extend([" "] * (width - 1))
+    lines.append("".join(render_chars))
+    line_attrs.append(attrs)
+
+
+def _normalized_draw_line(text_line: str, width: int) -> str:
+    try:
+        return (text_line + (" " * width))[:width]
+    except Exception:
+        return (str(text_line or "") + (" " * width))[:width]
+
+
+def _wide_placeholder_mask(text_line: str, width: int) -> List[bool]:
+    skip_cell = [False] * width
+    try:
+        for idx in range(max(0, width - 1)):
+            ch = text_line[idx]
+            if ch and unicodedata.east_asian_width(ch) in ("W", "F"):
+                skip_cell[idx + 1] = True
+    except Exception:
+        return [False] * width
+    return skip_cell
+
+
+def _normalized_attr_cells(attrs_cells: List[int], width: int, base_blank_attr: int) -> List[int]:
+    try:
+        if len(attrs_cells) < width:
+            return list(attrs_cells) + [base_blank_attr] * (width - len(attrs_cells))
+        return list(attrs_cells[:width])
+    except Exception:
+        return [base_blank_attr] * width
+
+
+def _selection_cell_attr(sel_range: Optional[Tuple[int, int]], idx: int, selected_attr: int, attrs_cells: List[int]) -> int:
+    if sel_range and sel_range[0] <= idx < sel_range[1]:
+        return selected_attr
+    return attrs_cells[idx]
+
+
+def _chunk_end_col(
+    sel_range: Optional[Tuple[int, int]],
+    start_col: int,
+    hist_w: int,
+    current_attr: int,
+    selected_attr: int,
+    attrs_cells: List[int],
+) -> int:
+    end_col = start_col + 1
+    while end_col < hist_w:
+        if _selection_cell_attr(sel_range, end_col, selected_attr, attrs_cells) != current_attr:
+            break
+        end_col += 1
+    return end_col
+
+
+def _visible_chunk(text_line: str, skip_cell: List[bool], start_col: int, end_col: int) -> str:
+    return "".join(text_line[idx] for idx in range(start_col, end_col) if not skip_cell[idx])
+
+
+def draw_attr_runs(
+    stdscr,
+    row_y: int,
+    text_line: str,
+    attrs_cells: List[int],
+    sel_range: Optional[Tuple[int, int]],
+    *,
+    hist_x: int,
+    hist_w: int,
+    selected_attr: int,
+    base_blank_attr: int,
+) -> None:
+    text_line = _normalized_draw_line(text_line, hist_w)
+    skip_cell = _wide_placeholder_mask(text_line, hist_w)
+    attrs_cells = _normalized_attr_cells(attrs_cells, hist_w, base_blank_attr)
+    col = 0
+    while col < hist_w:
+        if skip_cell[col]:
+            col += 1
+            continue
+        cur_attr = _selection_cell_attr(sel_range, col, selected_attr, attrs_cells)
+        end_col = _chunk_end_col(sel_range, col, hist_w, cur_attr, selected_attr, attrs_cells)
+        try:
+            chunk = _visible_chunk(text_line, skip_cell, col, end_col)
+            if chunk:
+                stdscr.addnstr(row_y, hist_x + col, chunk, end_col - col, cur_attr)
+        except Exception:
+            pass
+        col = end_col
+
+
+def _hotkey_help(state: ClientState) -> None:
+    state.help_mode = not state.help_mode
+    state.status = "Справка открыта" if state.help_mode else ""
+
+
+def _hotkey_profile(state: ClientState, net) -> None:
+    if state.profile_mode:
+        state.profile_mode = False
+        state.status = "Профиль закрыт"
+        _log_action("profile edit closed")
+        return
+    state.profile_mode = True
+    state.profile_field = 0
+    state.status = "Профиль: редактирование"
+    state.profile_name_input = ""
+    state.profile_handle_input = ""
+    try:
+        net.send({"type": "profile_get"})
+        _log_action("profile_get sent")
+    except Exception:
+        pass
+
+
+def _clear_search_overlays(state: ClientState) -> None:
+    try:
+        state.profile_mode = False
+        state.profile_view_mode = False
+        state.action_menu_mode = False
+        state.search_action_mode = False
+        state.modal_message = None
+    except Exception:
+        pass
+
+
+def _hotkey_search(state: ClientState) -> None:
+    _clear_search_overlays(state)
+    state.search_mode = True
+    state.search_query = ""
+    state.search_results = []
+    state.search_live_id = None
+    state.search_live_ok = False
+    state.selected_index = 0
+    state.status = "Режим поиска: введите ID/@логин и Enter"
+    _touch_contact_rows(state)
+    _log_action("search mode ON")
+
+
+def _set_group_create_defaults(state: ClientState) -> None:
+    state.search_action_mode = False
+    state.search_action_peer = None
+    state.search_action_options = []
+    state.search_mode = False
+    state.profile_view_mode = False
+    state.profile_mode = False
+    state.modal_message = None
+    state.group_create_mode = True  # type: ignore[attr-defined]
+    state.group_create_field = 0  # type: ignore[attr-defined]
+    state.group_name_input = getattr(state, 'group_name_input', '') or ""  # type: ignore[attr-defined]
+    state.group_members_input = getattr(state, 'group_members_input', '') or ""  # type: ignore[attr-defined]
+    state.status = "Создание чата: введите имя и участников"
+    _touch_contact_rows(state)
+
+
+def _set_board_create_defaults(state: ClientState) -> None:
+    state.search_action_mode = False
+    state.search_action_peer = None
+    state.search_action_options = []
+    state.search_mode = False
+    state.profile_view_mode = False
+    state.profile_mode = False
+    state.modal_message = None
+    state.board_create_mode = True
+    state.board_create_field = 0
+    state.board_name_input = getattr(state, 'board_name_input', '') or ""
+    state.board_handle_input = getattr(state, 'board_handle_input', '') or ""
+    state.status = "Создание доски: введите имя и логин"
+    _touch_contact_rows(state)
+
+
+def _hotkey_screen_dump(state: ClientState, stdscr) -> None:
+    _log_action("screen dump (F4)")
+    copied, saved_path = copy_screen_to_clipboard(stdscr)
+    if copied:
+        state.status = "Экран скопирован в буфер"
+    elif saved_path:
+        state.status = f"Буфер недоступен; сохранено: {saved_path}"
+    else:
+        state.status = "Копирование экрана не удалось"
+
+
+def _hotkey_file_browser(state: ClientState, start_file_browser, close_file_browser) -> None:
+    try:
+        _log_action("file browser open")
+        start_file_browser(state)  # type: ignore[misc]
+    except Exception:
+        logging.getLogger('client').exception("Failed to open file browser")
+        close_file_browser(state)  # type: ignore[misc]
+        state.status = "Не удалось открыть файловый менеджер"
 
 
 def draw_ui(stdscr, state: ClientState):
@@ -5331,76 +5950,6 @@ def draw_ui(stdscr, state: ClientState):
     title_w = max(0, left_w - 1)
     stdscr.addnstr(1, 1, pad_to_width(title, title_w), title_w, CP.get('title', curses.A_BOLD))
 
-    # Helper to build label from profile
-    def label_for(uid: str) -> str:
-        # Pending board invite token (BINV:<bid>) → blinking bell + board name
-        if isinstance(uid, str) and uid.startswith('BINV:'):
-            try:
-                bid = uid.split(':', 1)[1]
-            except Exception:
-                bid = uid
-            meta = (getattr(state, 'board_pending_invites', {}) or {}).get(bid, {})
-            name = str(meta.get('name') or bid)
-            try:
-                blink_on = int(time.time() * 2) % 2 == 0
-            except Exception:
-                blink_on = True
-            bell = "🔔 " if blink_on else "   "
-            return f"{bell}{name}"
-        if isinstance(uid, str) and uid.startswith('GINV:'):
-            try:
-                gid = uid.split(':', 1)[1]
-            except Exception:
-                gid = uid
-            meta = (getattr(state, 'group_pending_invites', {}) or {}).get(gid, {})
-            name = str(meta.get('name') or gid)
-            try:
-                blink_on = int(time.time() * 2) % 2 == 0
-            except Exception:
-                blink_on = True
-            bell = "🔔 " if blink_on else "   "
-            return f"{bell}{name}"
-        # Group label
-        if isinstance(uid, str) and uid.startswith('JOIN:'):
-            try:
-                _, gid, rid = uid.split(':', 2)
-            except Exception:
-                return uid
-            g = state.groups.get(gid) or {}
-            gname = str(g.get('name') or gid)
-            prof = state.profiles.get(rid) or {}
-            dn = (prof.get('display_name') or '').strip()
-            hh = (prof.get('handle') or '').strip()
-            who = dn or hh or rid
-            return f"⏳ Запрос в чат {gname} от {who}"
-        if uid in getattr(state, 'boards', {}):
-            b = state.boards.get(uid) or {}
-            name = str(b.get('name') or uid)
-            handle = str(b.get('handle') or '')
-            suffix = f" [{handle[1:]}]" if handle and handle.startswith('@') else (f" [{handle}]" if handle else '')
-            return f"# {name}{suffix}"
-        if uid in state.groups:
-            g = state.groups.get(uid) or {}
-            name = str(g.get('name') or uid)
-            handle = str(g.get('handle') or '')
-            # Показываем только имя чата и, при наличии, [login] (без '@'). ID скрываем
-            suffix = f" [{handle[1:]}]" if handle and handle.startswith('@') else (f" [{handle}]" if handle else '')
-            return f"# {name}{suffix}"
-        prof = state.profiles.get(uid) or {}
-        dn = (prof.get('display_name') or '').strip()
-        hh = (prof.get('handle') or '').strip()
-        # Source of truth for presence: statuses map
-        online = bool(state.statuses.get(uid))
-        icon = status_icon(online)
-        if dn:
-            base = f"{icon} {dn}"
-            if hh:
-                base += f" ({hh})"
-            return f"{base} [{uid}]"
-        if hh:
-            return f"{icon} {hh} [{uid}]"
-        return f"{icon} {uid}"
-
     # Ensure trailing ID fits into the left column by trimming the prefix with ellipsis
     # Use shared fit_contact_label imported at module level (with fallback)
 
@@ -5541,7 +6090,7 @@ def draw_ui(stdscr, state: ClientState):
             attr = curses.A_NORMAL
             if idx == state.selected_index:
                 attr = CP.get('selected', curses.A_REVERSE)
-            label = label_for(tok)
+            label = contact_label_for(state, tok)
             try:
                 blocked_union = set(state.blocked) | set(getattr(state, 'blocked_by', set()))
             except Exception:
@@ -5622,7 +6171,7 @@ def draw_ui(stdscr, state: ClientState):
         chat_title = " Режим поиска (Enter — найти) "
     else:
         if sel_contact:
-            who_label = label_for(sel_contact)
+            who_label = contact_label_for(state, sel_contact)
         else:
             who_label = '—'
         chat_title = f" Чат с: {who_label} "
@@ -5843,91 +6392,14 @@ def draw_ui(stdscr, state: ClientState):
                 else:
                     prefix = f"{t}: "
 
-                def _formatted_chars(raw: str):
-                    s = raw or ""
-                    out: List[Tuple[str, int]] = []
-                    strong_attr = (CP.get('title', curses.A_BOLD) or curses.A_BOLD)
-                    link_attr = (CP.get('title', curses.A_UNDERLINE) or curses.A_UNDERLINE) | curses.A_BOLD
-
-                    while s:
-                        if s.startswith("**"):
-                            end = s.find("**", 2)
-                            if end != -1:
-                                for ch in s[2:end]:
-                                    out.append((ch, strong_attr))
-                                s = s[end + 2:]
-                                continue
-                        if s.startswith("["):
-                            mid = s.find("](")
-                            end = s.find(")", mid + 2) if mid != -1 else -1
-                            if mid != -1 and end != -1:
-                                label = s[1:mid]
-                                for ch in label:
-                                    out.append((ch, link_attr))
-                                s = s[end + 1:]
-                                continue
-                        out.append((s[0], curses.A_NORMAL))
-                        s = s[1:]
-                    return out
-
-                ZERO_WIDTH = {"\u200d", "\u200c", "\ufeff", "\u200b", "\u200e", "\u200f", "\ufe0e", "\ufe0f"}
-
-                def _is_zero_width(ch: str) -> bool:
-                    if ch in ZERO_WIDTH:
-                        return True
-                    try:
-                        if unicodedata.category(ch) == "Cf":
-                            return True
-                    except Exception:
-                        pass
-                    return False
-
-                def _wcw(ch: str) -> int:
-                    # Avoid per-char imports (wcwidth may be absent). Use shared display_width() cache.
-                    try:
-                        if _is_zero_width(ch) or unicodedata.combining(ch):
-                            return 0
-                    except Exception:
-                        pass
-                    try:
-                        return int(display_width(ch))
-                    except Exception:
-                        return 1
-
-                def _cells_from_string(s: str, attr: int) -> List[Tuple[str, int, int]]:
-                    cells: List[Tuple[str, int, int]] = []
-                    for ch in s:
-                        if _is_zero_width(ch):
-                            if cells:
-                                txt, a, w = cells[-1]
-                                cells[-1] = (txt + ch, a, w)
-                            continue
-                        if unicodedata.combining(ch):
-                            if cells:
-                                txt, a, w = cells[-1]
-                                cells[-1] = (txt + ch, a, w)
-                            continue
-                        w = max(1, _wcw(ch))
-                        cells.append((ch, attr, w))
-                    return cells
-
-                def _flush_line(cells: List[Tuple[str, int, int]]) -> None:
-                    if not cells:
-                        return
-                    render_chars: List[str] = []
-                    attrs: List[int] = []
-                    for txt, attr, w in cells:
-                        render_chars.append(txt)
-                        attrs.extend([attr] * max(1, w))
-                        if w > 1:
-                            render_chars.extend([" "] * (w - 1))
-                    lines.append("".join(render_chars))
-                    line_attrs.append(attrs)
-
                 suffix = ''
                 suffix_color = None
 
-                content_chars = _formatted_chars(m.text)
+                content_chars = formatted_chars(
+                    m.text,
+                    strong_attr=(CP.get('title', curses.A_BOLD) or curses.A_BOLD),
+                    link_attr=(CP.get('title', curses.A_UNDERLINE) or curses.A_UNDERLINE) | curses.A_BOLD,
+                )
                 def _strip_bold(attr: int) -> int:
                     try:
                         return attr & ~(curses.A_BOLD | curses.A_STANDOUT)
@@ -5935,16 +6407,16 @@ def draw_ui(stdscr, state: ClientState):
                         return curses.A_NORMAL
                 base_attr = _strip_bold(CP.get('success', curses.A_NORMAL)) if m.direction == 'out' else curses.A_NORMAL
                 # Build wrapped lines char-by-char with width awareness (combining marks stay inside same cell)
-                cur_line_cells: List[Tuple[str, int, int]] = _cells_from_string(prefix, base_attr)
+                cur_line_cells: List[Tuple[str, int, int]] = cells_from_string(prefix, base_attr)
                 cur_cols = sum(c[2] for c in cur_line_cells)
-                pad_cells = _cells_from_string(" " * len(prefix), base_attr)
+                pad_cells = cells_from_string(" " * len(prefix), base_attr)
                 pad_cols = sum(c[2] for c in pad_cells)
 
                 for ch, attr in content_chars:
                     # Preserve explicit newlines inside messages without letting control chars leak into curses
                     # rendering (printing '\n' would move the cursor and corrupt the layout).
                     if ch in ('\n', '\r'):
-                        _flush_line(cur_line_cells)
+                        flush_render_line(lines, line_attrs, cur_line_cells)
                         cur_line_cells = list(pad_cells)
                         cur_cols = pad_cols
                         continue
@@ -5952,7 +6424,7 @@ def draw_ui(stdscr, state: ClientState):
                         # Expand tab to spaces (simple, predictable in TUI).
                         for _ in range(4):
                             if (cur_cols + 1) > hist_w and cur_line_cells:
-                                _flush_line(cur_line_cells)
+                                flush_render_line(lines, line_attrs, cur_line_cells)
                                 cur_line_cells = list(pad_cells)
                                 cur_cols = pad_cols
                             cur_line_cells.append((' ', base_attr | attr, 1))
@@ -5964,7 +6436,7 @@ def draw_ui(stdscr, state: ClientState):
                             ch = '␀'
                     except Exception:
                         pass
-                    if _is_zero_width(ch):
+                    if is_zero_width_char(ch):
                         if cur_line_cells:
                             txt, a, w = cur_line_cells[-1]
                             cur_line_cells[-1] = (txt + ch, a | attr, w)
@@ -5974,15 +6446,15 @@ def draw_ui(stdscr, state: ClientState):
                             txt, a, w = cur_line_cells[-1]
                             cur_line_cells[-1] = (txt + ch, a | attr, w)
                         continue
-                    w = max(1, _wcw(ch))
+                    w = max(1, char_display_width(ch))
                     if (cur_cols + w) > hist_w and cur_line_cells:
-                        _flush_line(cur_line_cells)
+                        flush_render_line(lines, line_attrs, cur_line_cells)
                         cur_line_cells = list(pad_cells)
                         cur_cols = pad_cols
                     cur_line_cells.append((ch, base_attr | attr, w))
                     cur_cols += w
                     if cur_cols >= hist_w:
-                        _flush_line(cur_line_cells)
+                        flush_render_line(lines, line_attrs, cur_line_cells)
                         cur_line_cells = list(pad_cells)
                         cur_cols = pad_cols
 
@@ -5993,9 +6465,9 @@ def draw_ui(stdscr, state: ClientState):
                                 txt, a, w = cur_line_cells[-1]
                                 cur_line_cells[-1] = (txt + ch, a, w)
                             continue
-                        w = max(1, _wcw(ch))
+                        w = max(1, char_display_width(ch))
                         if (cur_cols + w) > hist_w and cur_line_cells:
-                            _flush_line(cur_line_cells)
+                            flush_render_line(lines, line_attrs, cur_line_cells)
                             cur_line_cells = list(pad_cells)
                             cur_cols = pad_cols
                         cur_line_cells.append((ch, suffix_color or base_attr, w))
@@ -6003,7 +6475,7 @@ def draw_ui(stdscr, state: ClientState):
                     if suffix_color is not None:
                         check_meta[len(lines)] = int(suffix_color)
                 if cur_line_cells:
-                    _flush_line(cur_line_cells)
+                    flush_render_line(lines, line_attrs, cur_line_cells)
 
             # Persist cache for future scroll-only redraws
             try:
@@ -6063,56 +6535,6 @@ def draw_ui(stdscr, state: ClientState):
     chat_clear_w = max(0, w - chat_clear_x - 1)
     selected_attr = CP.get('selected', curses.A_REVERSE)
     base_blank_attr = curses.A_NORMAL
-
-    def _draw_attr_runs(row_y: int, text_line: str, attrs_cells: List[int], sel_range: Optional[Tuple[int, int]]) -> None:
-        # Render the row by batching consecutive cells with the same attribute.
-        try:
-            if len(text_line) < hist_w:
-                text_line = text_line + (" " * (hist_w - len(text_line)))
-            else:
-                text_line = text_line[:hist_w]
-        except Exception:
-            text_line = (str(text_line or "") + (" " * hist_w))[:hist_w]
-        # Skip placeholder cells inserted after wide characters to avoid breaking glyphs and shifting.
-        # History lines are built with "wide_char + spaces" to keep column indexing stable; we must not print
-        # those placeholder spaces in batched addnstr calls.
-        skip_cell = [False] * hist_w
-        try:
-            for k in range(max(0, hist_w - 1)):
-                ch = text_line[k]
-                if ch and unicodedata.east_asian_width(ch) in ("W", "F"):
-                    skip_cell[k + 1] = True
-        except Exception:
-            skip_cell = [False] * hist_w
-        try:
-            if len(attrs_cells) < hist_w:
-                attrs_cells = list(attrs_cells) + [base_blank_attr] * (hist_w - len(attrs_cells))
-            else:
-                attrs_cells = list(attrs_cells[:hist_w])
-        except Exception:
-            attrs_cells = [base_blank_attr] * hist_w
-
-        col = 0
-        while col < hist_w:
-            if skip_cell[col]:
-                col += 1
-                continue
-            in_sel = bool(sel_range and sel_range[0] <= col < sel_range[1])
-            cur_attr = selected_attr if in_sel else attrs_cells[col]
-            end_col = col + 1
-            while end_col < hist_w:
-                in_sel2 = bool(sel_range and sel_range[0] <= end_col < sel_range[1])
-                a2 = selected_attr if in_sel2 else attrs_cells[end_col]
-                if a2 != cur_attr:
-                    break
-                end_col += 1
-            try:
-                chunk = "".join(text_line[k] for k in range(col, end_col) if not skip_cell[k])
-                if chunk:
-                    stdscr.addnstr(row_y, hist_x + col, chunk, end_col - col, cur_attr)
-            except Exception:
-                pass
-            col = end_col
     # Очищаем область истории только когда реально перерисовываем, чтобы избежать мигания
     if redraw_history or menu_active:
         blank_row = " " * chat_clear_w
@@ -6195,7 +6617,17 @@ def draw_ui(stdscr, state: ClientState):
                 except Exception:
                     sel_range = None
 
-            _draw_attr_runs(hist_y + idx, text_line, attrs_cells, sel_range)
+            draw_attr_runs(
+                stdscr,
+                hist_y + idx,
+                text_line,
+                attrs_cells,
+                sel_range,
+                hist_x=hist_x,
+                hist_w=hist_w,
+                selected_attr=selected_attr,
+                base_blank_attr=base_blank_attr,
+            )
 
             try:
                 if (not state.select_active) and (i in check_meta):
@@ -6239,7 +6671,17 @@ def draw_ui(stdscr, state: ClientState):
                 else:
                     text_line = str(line_obj or "")
                 attrs_cells = list(attrs_line) if isinstance(attrs_line, list) else []
-            _draw_attr_runs(hist_y + j, text_line, attrs_cells, sel_range=None)
+            draw_attr_runs(
+                stdscr,
+                hist_y + j,
+                text_line,
+                attrs_cells,
+                sel_range=None,
+                hist_x=hist_x,
+                hist_w=hist_w,
+                selected_attr=selected_attr,
+                base_blank_attr=base_blank_attr,
+            )
     # Mark history clean after successful redraw (skip when menu blanks)
     if redraw_history and (not menu_active):
         try:
@@ -7391,46 +7833,64 @@ def main(stdscr):
         except Exception:
             pass
 
+    def _mousemask_enabled_value() -> int:
+        mask = int(getattr(curses, 'ALL_MOUSE_EVENTS', 0) or 0)
+        mask |= int(getattr(curses, 'REPORT_MOUSE_POSITION', 0) or 0)
+        return mask or 0
+
+    def _configure_curses_mouse(enabled: bool) -> None:
+        try:
+            curses.mousemask(_mousemask_enabled_value() if enabled else 0)
+            curses.mouseinterval(0)
+        except Exception:
+            pass
+
+    def _set_terminal_mouse_modes(enabled: bool) -> None:
+        if enabled:
+            seq = "\x1b[?1003l\x1b[?1007l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1015h\x1b[?1004h"
+        else:
+            seq = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?1007l\x1b[?1004l"
+        try:
+            _term_write(seq, tmux_passthrough=True)
+        except Exception:
+            pass
+
     def _apply_mouse(enabled: bool) -> None:
         global __MOUSE_ARMED__
         try:
-            if enabled:
-                # Ask curses for mouse events; we still keep terminal "any-motion" disabled (1003l)
-                # to avoid event storms while retaining wheel/click support.
-                try:
-                    mask = int(getattr(curses, 'ALL_MOUSE_EVENTS', 0) or 0)
-                    # Some curses builds behave better when REPORT_MOUSE_POSITION is requested,
-                    # even if the terminal side keeps 1003 disabled.
-                    mask |= int(getattr(curses, 'REPORT_MOUSE_POSITION', 0) or 0)
-                    curses.mousemask(mask or 0)
-                    curses.mouseinterval(0)
-                except Exception:
-                    pass
-                try:
-                    # Enable robust reporting in the terminal:
-                    # - 1000: basic clicks
-                    # - 1002: button events (many terminals require it for wheel/release)
-                    # - 1006/1015: extended coordinates encodings (SGR preferred)
-                    # Keep 1003 (any-motion) disabled to avoid event storms.
-                    # Also force-disable alternate scroll mode (1007), which can make the wheel look like ↑/↓ keys
-                    # after screen mode changes (seen on some terminals after overlays).
-                    _term_write("\x1b[?1003l\x1b[?1007l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1015h\x1b[?1004h", tmux_passthrough=True)
-                except Exception:
-                    pass
-                __MOUSE_ARMED__ = True
-            else:
-                try:
-                    curses.mousemask(0)
-                    curses.mouseinterval(0)
-                except Exception:
-                    pass
-                try:
-                    _term_write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?1007l\x1b[?1004l", tmux_passthrough=True)
-                except Exception:
-                    pass
-                __MOUSE_ARMED__ = False
-            # Always keep bracketed paste active during the TUI so pastes remain lossless
+            _configure_curses_mouse(enabled)
+            _set_terminal_mouse_modes(enabled)
+            __MOUSE_ARMED__ = bool(enabled)
             _set_bracketed_paste(True)
+        except Exception:
+            pass
+
+    def _tmux_auto_mouse_allowed() -> bool:
+        if not os.environ.get('TMUX'):
+            return False
+        value = str(os.environ.get('CLIENT_TMUX_AUTO_MOUSE', '1')).strip().lower()
+        return value not in ('0', 'no', 'false', 'off')
+
+    def _tmux_mouse_previous_value() -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ['tmux', 'show', '-gv', 'mouse'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=0.25,
+                check=False,
+            )
+        except Exception:
+            return None
+        return (result.stdout or '').strip()
+
+    def _append_tmux_debug(state: "ClientState", message: str) -> None:
+        try:
+            if getattr(state, 'debug_mode', False):
+                state.debug_lines.append(message)
+                if len(state.debug_lines) > 300:
+                    del state.debug_lines[:len(state.debug_lines) - 300]
         except Exception:
             pass
 
@@ -7438,24 +7898,9 @@ def main(stdscr):
         """Best-effort: if running under tmux, ensure tmux forwards mouse events to this app."""
         global __TMUX_MOUSE_PREV__, __TMUX_MOUSE_AUTO_ENABLED__
         try:
-            if not os.environ.get('TMUX'):
+            if not _tmux_auto_mouse_allowed():
                 return
-            v = str(os.environ.get('CLIENT_TMUX_AUTO_MOUSE', '1')).strip().lower()
-            if v in ('0', 'no', 'false', 'off'):
-                return
-            prev = None
-            try:
-                r = subprocess.run(
-                    ['tmux', 'show', '-gv', 'mouse'],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    timeout=0.25,
-                    check=False,
-                )
-                prev = (r.stdout or '').strip()
-            except Exception:
-                prev = None
+            prev = _tmux_mouse_previous_value()
             prev_norm = (prev or '').strip().lower()
             if prev_norm in ('', 'off', '0', 'false', 'no'):
                 try:
@@ -7472,13 +7917,7 @@ def main(stdscr):
                         state.tmux_mouse = 'on'
                     except Exception:
                         pass
-                    try:
-                        if getattr(state, 'debug_mode', False):
-                            state.debug_lines.append("[tmux] включено: set -g mouse on")
-                            if len(state.debug_lines) > 300:
-                                del state.debug_lines[:len(state.debug_lines) - 300]
-                    except Exception:
-                        pass
+                    _append_tmux_debug(state, "[tmux] включено: set -g mouse on")
                 except Exception:
                     pass
             else:
@@ -7564,95 +8003,18 @@ def main(stdscr):
     def trigger_hotkey(name: str) -> None:
         nonlocal state
         _log_action(f"hotkey {name} pressed")
-        if name == 'F1':
-            state.help_mode = not state.help_mode
-            state.status = "Справка открыта" if state.help_mode else ""
-        elif name == 'F2':
-            if state.profile_mode:
-                state.profile_mode = False
-                state.status = "Профиль закрыт"
-                _log_action("profile edit closed")
-            else:
-                state.profile_mode = True
-                state.profile_field = 0
-                state.status = "Профиль: редактирование"
-                state.profile_name_input = ""
-                state.profile_handle_input = ""
-                try:
-                    net.send({"type": "profile_get"})
-                    _log_action("profile_get sent")
-                except Exception:
-                    pass
-        elif name == 'F3':
-            # Close conflicting overlays/modals
-            try:
-                state.profile_mode = False
-                state.profile_view_mode = False
-                state.action_menu_mode = False
-                state.search_action_mode = False
-                state.modal_message = None
-            except Exception:
-                pass
-            state.search_mode = True
-            state.search_query = ""
-            state.search_results = []
-            state.search_live_id = None
-            state.search_live_ok = False
-            state.selected_index = 0
-            state.status = "Режим поиска: введите ID/@логин и Enter"
-            _touch_contact_rows(state)
-            _log_action("search mode ON")
-        elif name == 'F4':
-            _log_action("screen dump (F4)")
-            copied, saved_path = copy_screen_to_clipboard(stdscr)
-            if copied:
-                state.status = "Экран скопирован в буфер"
-            elif saved_path:
-                state.status = f"Буфер недоступен; сохранено: {saved_path}"
-            else:
-                state.status = "Копирование экрана не удалось"
-        elif name == 'F5':
-            try:
-                state.search_action_mode = False
-                state.search_action_peer = None
-                state.search_action_options = []
-                state.search_mode = False
-                state.profile_view_mode = False
-                state.profile_mode = False
-                state.modal_message = None
-                state.group_create_mode = True  # type: ignore[attr-defined]
-                state.group_create_field = 0    # type: ignore[attr-defined]
-                state.group_name_input = getattr(state, 'group_name_input', '') or ""  # type: ignore[attr-defined]
-                state.group_members_input = getattr(state, 'group_members_input', '') or ""  # type: ignore[attr-defined]
-                state.status = "Создание чата: введите имя и участников"
-                _touch_contact_rows(state)
-                _log_action("group create modal open")
-            except Exception:
-                pass
-        elif name == 'F6':
-            try:
-                state.search_action_mode = False
-                state.search_action_peer = None
-                state.search_action_options = []
-                state.search_mode = False
-                state.profile_view_mode = False
-                state.profile_mode = False
-                state.modal_message = None
-                state.board_create_mode = True
-                state.board_create_field = 0
-                state.board_name_input = getattr(state, 'board_name_input', '') or ""
-                state.board_handle_input = getattr(state, 'board_handle_input', '') or ""
-                state.status = "Создание доски: введите имя и логин"
-                _touch_contact_rows(state)
-                _log_action("board create modal open")
-            except Exception:
-                pass
-        elif name == 'F7':
-            try:
-                _log_action("file browser open")
-                start_file_browser(state)  # type: ignore[name-defined]
-            except Exception:
-                close_file_browser(state)  # type: ignore[name-defined]
+        handlers = {
+            'F1': lambda: _hotkey_help(state),
+            'F2': lambda: _hotkey_profile(state, net),
+            'F3': lambda: _hotkey_search(state),
+            'F4': lambda: _hotkey_screen_dump(state, stdscr),
+            'F5': lambda: (_set_group_create_defaults(state), _log_action("group create modal open")),
+            'F6': lambda: (_set_board_create_defaults(state), _log_action("board create modal open")),
+            'F7': lambda: _hotkey_file_browser(state, start_file_browser, close_file_browser),  # type: ignore[arg-type]
+        }
+        handler = handlers.get(name)
+        if handler is not None:
+            handler()
 
     def handle_hotkey_click(mx: int, my: int) -> bool:
         if my != 0:
@@ -10139,6 +10501,12 @@ def main(stdscr):
                         continue
                     if isinstance(nxt, str):
                         buf += nxt
+                        try:
+                            if normalize_function_key_escape(buf):
+                                seq_complete = True
+                                break
+                        except Exception:
+                            pass
                         if x10_left > 0:
                             x10_left -= 1
                             if x10_left == 0:
@@ -10188,6 +10556,20 @@ def main(stdscr):
                     state.debug_last_seq = ch
                 if KEYLOG_ENABLED:
                     logging.getLogger('client').debug('KEY evt: %r (%s)', ch, ('str' if isinstance(ch, str) else f'int:{ch}'))
+        except Exception:
+            pass
+
+        try:
+            if isinstance(ch, str):
+                fn = normalize_function_key_escape(ch)
+                if fn and fn.startswith('F'):
+                    try:
+                        ch = getattr(curses, f'KEY_{fn}')
+                    except Exception:
+                        try:
+                            ch = getattr(curses, 'KEY_F0', 264) + int(fn[1:])
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -10835,7 +11217,7 @@ def main(stdscr):
                     sp = _fm_norm_path(str(base / name))
                 except Exception:
                     sp = str(base / name)
-                txt = f"/file {sp}"
+                txt = format_file_command(sp)
                 try:
                     state.input_buffer = txt
                     state.input_caret = len(txt)
@@ -11140,1772 +11522,6 @@ def main(stdscr):
 
             # Block any other keys while modal is open
             continue
-
-            import os as _os
-            from pathlib import Path as _Path
-            def _list_dir(p, for_side=None):
-                """Fallback lister that honors saved prefs (show_hidden/view/dirs_first/reverse).
-
-                - Only name-sorting is supported here (mtime sorts require extra stat and are handled by module path).
-                - If for_side is None, uses the currently active pane in state.file_browser_side.
-                """
-                try:
-                    base = str(_Path(p).expanduser().resolve())
-                except Exception:
-                    base = str(_Path('.').resolve())
-                if for_side is None:
-                    try:
-                        for_side = int(getattr(state, 'file_browser_side', 0))
-                    except Exception:
-                        for_side = 0
-                # Read flags
-                show_hidden = bool(getattr(state, 'file_browser_show_hidden0', True)) if for_side == 0 else bool(getattr(state, 'file_browser_show_hidden1', True))
-                view = getattr(state, 'file_browser_view0', None) if for_side == 0 else getattr(state, 'file_browser_view1', None)
-                reverse = bool(getattr(state, 'file_browser_reverse0', False)) if for_side == 0 else bool(getattr(state, 'file_browser_reverse1', False))
-                dirs_first = bool(getattr(state, 'file_browser_dirs_first0', False)) if for_side == 0 else bool(getattr(state, 'file_browser_dirs_first1', False))
-                # List + filters
-                try:
-                    names = sorted(_os.listdir(base), key=lambda s: s.lower(), reverse=reverse)
-                except Exception:
-                    names = []
-                items = []
-                for name in names:
-                    if (not show_hidden) and name.startswith('.') and name != '..':
-                        continue
-                    full = _os.path.join(base, name)
-                    is_dir = bool(_os.path.isdir(full))
-                    if view == 'dirs' and (not is_dir):
-                        continue
-                    if view == 'files' and is_dir:
-                        continue
-                    items.append((name, is_dir))
-                if dirs_first and items:
-                    items = [e for e in items if e[1]] + [e for e in items if not e[1]]
-                # Parent row
-                try:
-                    parent = _os.path.dirname(base.rstrip(_os.sep)) or base
-                    if parent and parent != base:
-                        items = [('..', True)] + items
-                except Exception:
-                    pass
-                return items
-            def _list_dir_opts2(p, *, show_hidden=True, view=None, reverse=False, dirs_first=False):
-                import os as __os
-                from pathlib import Path as __Path
-                try:
-                    base = str(__Path(p).expanduser().resolve())
-                except Exception:
-                    base = str(__Path('.').resolve())
-                names = []
-                try:
-                    names = sorted(__os.listdir(base), key=lambda s: s.lower(), reverse=bool(reverse))
-                except Exception:
-                    names = []
-                items = []
-                for name in names:
-                    if (not show_hidden) and name.startswith('.') and name != '..':
-                        continue
-                    full = __os.path.join(base, name)
-                    is_dir = bool(__os.path.isdir(full))
-                    if view == 'dirs' and (not is_dir):
-                        continue
-                    if view == 'files' and is_dir:
-                        continue
-                    items.append((name, is_dir))
-                if dirs_first and items:
-                    items = [e for e in items if e[1]] + [e for e in items if not e[1]]
-                try:
-                    parent = __os.path.dirname(base.rstrip(__os.sep)) or base
-                    if parent and parent != base:
-                        items = [('..', True)] + items
-                except Exception:
-                    pass
-                return items
-
-            def _toggle_hidden(for_side: int) -> bool:
-                """Toggle hidden-files visibility for pane side (0/1). Returns new flag."""
-                try:
-                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                        st = state.file_browser_state
-                        cur = str(getattr(st, 'path0' if for_side == 0 else 'path1', str(_Path('.').resolve())))
-                        val = not bool(getattr(st, 'show_hidden0' if for_side == 0 else 'show_hidden1', True))
-                        if for_side == 0:
-                            st.show_hidden0 = val
-                            state.file_browser_show_hidden0 = val
-                            st.items0 = fb_list(cur, show_hidden=val, sort=str(getattr(st, 'sort0', 'name')), dirs_first=bool(getattr(st, 'dirs_first0', False)), reverse=bool(getattr(st, 'reverse0', False)), view=getattr(st, 'view0', None))
-                            st.index0 = 0 if not st.items0 else min(st.index0, len(st.items0) - 1)
-                        else:
-                            st.show_hidden1 = val
-                            state.file_browser_show_hidden1 = val
-                            st.items1 = fb_list(cur, show_hidden=val, sort=str(getattr(st, 'sort1', 'name')), dirs_first=bool(getattr(st, 'dirs_first1', False)), reverse=bool(getattr(st, 'reverse1', False)), view=getattr(st, 'view1', None))
-                            st.index1 = 0 if not st.items1 else min(st.index1, len(st.items1) - 1)
-                        state.file_browser_state = st
-                        try:
-                            _save_fb_prefs(st)
-                            net.send({
-                                "type": getattr(T, 'PREFS_SET', 'prefs_set'),
-                                "values": {
-                                    "fb_show_hidden0": bool(getattr(st, 'show_hidden0', True)),
-                                    "fb_show_hidden1": bool(getattr(st, 'show_hidden1', True)),
-                                    "fb_sort0": str(getattr(st, 'sort0', 'name')),
-                                    "fb_sort1": str(getattr(st, 'sort1', 'name')),
-                                    "fb_dirs_first0": bool(getattr(st, 'dirs_first0', False)),
-                                    "fb_dirs_first1": bool(getattr(st, 'dirs_first1', False)),
-                                    "fb_reverse0": bool(getattr(st, 'reverse0', False)),
-                                    "fb_reverse1": bool(getattr(st, 'reverse1', False)),
-                                    "fb_view0": getattr(st, 'view0', None),
-                                    "fb_view1": getattr(st, 'view1', None),
-                                }
-                            })
-                        except Exception:
-                            pass
-                        return val
-                    else:
-                        side = for_side
-                        path = state.file_browser_path0 if side == 0 else state.file_browser_path1
-                        flag = not bool(getattr(state, 'file_browser_show_hidden' + str(side), True))
-                        if side == 0:
-                            state.file_browser_show_hidden0 = flag
-                        else:
-                            state.file_browser_show_hidden1 = flag
-                        items = _list_dir_opts2(
-                            path,
-                            show_hidden=bool(state.file_browser_show_hidden0 if side == 0 else state.file_browser_show_hidden1),
-                            view=getattr(state, 'file_browser_view0' if side == 0 else 'file_browser_view1', None),
-                            reverse=bool(state.file_browser_reverse0 if side == 0 else state.file_browser_reverse1),
-                            dirs_first=bool(state.file_browser_dirs_first0 if side == 0 else state.file_browser_dirs_first1),
-                        )
-                        if side == 0:
-                            state.file_browser_items0 = items; state.file_browser_index0 = 0
-                        else:
-                            state.file_browser_items1 = items; state.file_browser_index1 = 0
-                        try:
-                            _save_fb_prefs_values(
-                                fb_show_hidden0=bool(getattr(state, 'file_browser_show_hidden0', True)),
-                                fb_show_hidden1=bool(getattr(state, 'file_browser_show_hidden1', True)),
-                                fb_sort0=str(getattr(state, 'file_browser_sort0', 'name')),
-                                fb_sort1=str(getattr(state, 'file_browser_sort1', 'name')),
-                                fb_dirs_first0=bool(getattr(state, 'file_browser_dirs_first0', False)),
-                                fb_dirs_first1=bool(getattr(state, 'file_browser_dirs_first1', False)),
-                                fb_reverse0=bool(getattr(state, 'file_browser_reverse0', False)),
-                                fb_reverse1=bool(getattr(state, 'file_browser_reverse1', False)),
-                                fb_view0=getattr(state, 'file_browser_view0', None),
-                                fb_view1=getattr(state, 'file_browser_view1', None),
-                                fb_path0=str(getattr(state, 'file_browser_path0', '') or ''),
-                                fb_path1=str(getattr(state, 'file_browser_path1', '') or ''),
-                                fb_side=int(getattr(state, 'file_browser_side', side)),
-                            )
-                            net.send({
-                                "type": getattr(T, 'PREFS_SET', 'prefs_set'),
-                                "values": {
-                                    "fb_show_hidden0": bool(getattr(state, 'file_browser_show_hidden0', True)),
-                                    "fb_show_hidden1": bool(getattr(state, 'file_browser_show_hidden1', True)),
-                                    "fb_sort0": str(getattr(state, 'file_browser_sort0', 'name')),
-                                    "fb_sort1": str(getattr(state, 'file_browser_sort1', 'name')),
-                                    "fb_dirs_first0": bool(getattr(state, 'file_browser_dirs_first0', False)),
-                                    "fb_dirs_first1": bool(getattr(state, 'file_browser_dirs_first1', False)),
-                                    "fb_reverse0": bool(getattr(state, 'file_browser_reverse0', False)),
-                                    "fb_reverse1": bool(getattr(state, 'file_browser_reverse1', False)),
-                                    "fb_view0": getattr(state, 'file_browser_view0', None),
-                                    "fb_view1": getattr(state, 'file_browser_view1', None),
-                                }
-                            })
-                        except Exception:
-                            pass
-                        return flag
-                except Exception:
-                    return True
-            # ESC — close
-            if ch in ('\x1b',) or ch == 27:
-                state.file_browser_view_mode = False
-                state.file_browser_settings_mode = False
-                close_file_browser(state)  # type: ignore[name-defined]
-                state.status = ""
-                continue
-            # Settings modal (hidden files toggle)
-            if getattr(state, 'file_browser_settings_mode', False):
-                if ch in ('\x1b',) or ch == 27:
-                    state.file_browser_settings_mode = False
-                    continue
-                if (
-                    ch in ('\t', getattr(curses, 'KEY_BTAB', -9999), getattr(curses, 'KEY_STAB', -9999))
-                    or ch in (curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_UP, curses.KEY_DOWN)
-                ):
-                    try:
-                        cur = int(getattr(state, 'file_browser_settings_side', int(getattr(state, 'file_browser_side', 0))))
-                    except Exception:
-                        cur = 0
-                    state.file_browser_settings_side = 1 - cur
-                    continue
-                if ch in ('\n', '\r') or ch in (10, 13, curses.KEY_ENTER):
-                    try:
-                        side_sel = int(getattr(state, 'file_browser_settings_side', int(getattr(state, 'file_browser_side', 0))))
-                    except Exception:
-                        side_sel = 0
-                    flag = _toggle_hidden(side_sel)
-                    state.status = "Скрытые: " + ("Вкл" if flag else "Выкл")
-                    state.file_browser_settings_mode = False
-                    continue
-                # Block other keys while settings open
-                continue
-            # Toggle hidden files for active pane (legacy shortcut, kept but not advertised)
-            if isinstance(ch, str) and ch.lower() == 'h':
-                try:
-                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                        st = state.file_browser_state
-                        side = int(getattr(st, 'side', 0))
-                        if side == 0:
-                            cur = str(getattr(st, 'path0', str(_Path('.').resolve())))
-                            val = not bool(getattr(st, 'show_hidden0', True))
-                            st.show_hidden0 = val
-                            st.items0 = fb_list(cur, show_hidden=val, sort=str(getattr(st, 'sort0', 'name')), dirs_first=bool(getattr(st, 'dirs_first0', False)), reverse=bool(getattr(st, 'reverse0', False)))
-                            st.index0 = 0 if not st.items0 else min(st.index0, len(st.items0)-1)
-                        else:
-                            cur = str(getattr(st, 'path1', str(_Path('.').resolve())))
-                            val = not bool(getattr(st, 'show_hidden1', True))
-                            st.show_hidden1 = val
-                            st.items1 = fb_list(cur, show_hidden=val, sort=str(getattr(st, 'sort1', 'name')), dirs_first=bool(getattr(st, 'dirs_first1', False)), reverse=bool(getattr(st, 'reverse1', False)))
-                            st.index1 = 0 if not st.items1 else min(st.index1, len(st.items1)-1)
-                        state.status = "Скрытые: " + ("Вкл" if val else "Выкл")
-                    else:
-                        # fallback: rebuild items using persisted-like preferences
-                        side = int(getattr(state, 'file_browser_side', 0))
-                        path = state.file_browser_path0 if side == 0 else state.file_browser_path1
-                        # Toggle state flag
-                        flag = not bool(getattr(state, 'file_browser_show_hidden' + str(side), True))
-                        if side == 0:
-                            state.file_browser_show_hidden0 = flag
-                        else:
-                            state.file_browser_show_hidden1 = flag
-                        # Apply list rebuild (name sort only)
-                        def _list_dir_opts2(p, *, show_hidden=True, view=None, reverse=False, dirs_first=False):
-                            import os as __os
-                            from pathlib import Path as __Path
-                            try:
-                                base = str(__Path(p).expanduser().resolve())
-                            except Exception:
-                                base = str(__Path('.').resolve())
-                            names = []
-                            try:
-                                names = sorted(__os.listdir(base), key=lambda s: s.lower(), reverse=bool(reverse))
-                            except Exception:
-                                names = []
-                            items = []
-                            for name in names:
-                                if (not show_hidden) and name.startswith('.') and name != '..':
-                                    continue
-                                full = __os.path.join(base, name)
-                                is_dir = bool(__os.path.isdir(full))
-                                if view == 'dirs' and (not is_dir):
-                                    continue
-                                if view == 'files' and is_dir:
-                                    continue
-                                items.append((name, is_dir))
-                            if dirs_first and items:
-                                items = [e for e in items if e[1]] + [e for e in items if not e[1]]
-                            try:
-                                parent = __os.path.dirname(base.rstrip(__os.sep)) or base
-                                if parent and parent != base:
-                                    items = [('..', True)] + items
-                            except Exception:
-                                pass
-                            return items
-                        if side == 0:
-                            items = _list_dir_opts2(path, show_hidden=bool(state.file_browser_show_hidden0), view=getattr(state, 'file_browser_view0', None), reverse=bool(state.file_browser_reverse0), dirs_first=bool(state.file_browser_dirs_first0))
-                            state.file_browser_items0 = items; state.file_browser_index0 = 0
-                        else:
-                            items = _list_dir_opts2(path, show_hidden=bool(state.file_browser_show_hidden1), view=getattr(state, 'file_browser_view1', None), reverse=bool(state.file_browser_reverse1), dirs_first=bool(state.file_browser_dirs_first1))
-                            state.file_browser_items1 = items; state.file_browser_index1 = 0
-                        # Persist fallback flags
-                        _save_fb_prefs_values(
-                            fb_show_hidden0=bool(getattr(state, 'file_browser_show_hidden0', True)),
-                            fb_show_hidden1=bool(getattr(state, 'file_browser_show_hidden1', True)),
-                            fb_sort0=str(getattr(state, 'file_browser_sort0', 'name')),
-                            fb_sort1=str(getattr(state, 'file_browser_sort1', 'name')),
-                            fb_dirs_first0=bool(getattr(state, 'file_browser_dirs_first0', False)),
-                            fb_dirs_first1=bool(getattr(state, 'file_browser_dirs_first1', False)),
-                            fb_reverse0=bool(getattr(state, 'file_browser_reverse0', False)),
-                            fb_reverse1=bool(getattr(state, 'file_browser_reverse1', False)),
-                            fb_view0=getattr(state, 'file_browser_view0', None),
-                            fb_view1=getattr(state, 'file_browser_view1', None),
-                            fb_path0=str(getattr(state, 'file_browser_path0', '') or ''),
-                            fb_path1=str(getattr(state, 'file_browser_path1', '') or ''),
-                            fb_side=int(getattr(state, 'file_browser_side', side)),
-                        )
-                        state.status = "Скрытые: " + ("Вкл" if flag else "Выкл")
-                    # Persist locally and sync to server
-                    try:
-                        if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                            st2 = state.file_browser_state
-                            _save_fb_prefs(st2)
-                            net.send({
-                                "type": getattr(T,'PREFS_SET','prefs_set'),
-                                "values": {
-                                    "fb_show_hidden0": bool(getattr(st2,'show_hidden0',True)),
-                                    "fb_show_hidden1": bool(getattr(st2,'show_hidden1',True)),
-                                    "fb_sort0": str(getattr(st2,'sort0','name')),
-                                    "fb_sort1": str(getattr(st2,'sort1','name')),
-                                    "fb_dirs_first0": bool(getattr(st2,'dirs_first0',False)),
-                                    "fb_dirs_first1": bool(getattr(st2,'dirs_first1',False)),
-                                    "fb_reverse0": bool(getattr(st2,'reverse0',False)),
-                                    "fb_reverse1": bool(getattr(st2,'reverse1',False)),
-                                    "fb_view0": getattr(st2,'view0',None),
-                                    "fb_view1": getattr(st2,'view1',None),
-                                }
-                            })
-                        else:
-                            _save_fb_prefs_values(
-                                fb_show_hidden0=bool(getattr(state, 'file_browser_show_hidden0', True)),
-                                fb_show_hidden1=bool(getattr(state, 'file_browser_show_hidden1', True)),
-                                fb_sort0=str(getattr(state, 'file_browser_sort0', 'name')),
-                                fb_sort1=str(getattr(state, 'file_browser_sort1', 'name')),
-                                fb_dirs_first0=bool(getattr(state, 'file_browser_dirs_first0', False)),
-                                fb_dirs_first1=bool(getattr(state, 'file_browser_dirs_first1', False)),
-                                fb_reverse0=bool(getattr(state, 'file_browser_reverse0', False)),
-                                fb_reverse1=bool(getattr(state, 'file_browser_reverse1', False)),
-                                fb_view0=getattr(state, 'file_browser_view0', None),
-                                fb_view1=getattr(state, 'file_browser_view1', None),
-                                fb_path0=str(getattr(state, 'file_browser_path0', '') or ''),
-                                fb_path1=str(getattr(state, 'file_browser_path1', '') or ''),
-                                fb_side=int(getattr(state, 'file_browser_side', 0)),
-                            )
-                            net.send({
-                                "type": getattr(T,'PREFS_SET','prefs_set'),
-                                "values": {
-                                    "fb_show_hidden0": bool(getattr(state,'file_browser_show_hidden0',True)),
-                                    "fb_show_hidden1": bool(getattr(state,'file_browser_show_hidden1',True)),
-                                    "fb_sort0": str(getattr(state,'file_browser_sort0','name')),
-                                    "fb_sort1": str(getattr(state,'file_browser_sort1','name')),
-                                    "fb_dirs_first0": bool(getattr(state,'file_browser_dirs_first0',False)),
-                                    "fb_dirs_first1": bool(getattr(state,'file_browser_dirs_first1',False)),
-                                    "fb_reverse0": bool(getattr(state,'file_browser_reverse0',False)),
-                                    "fb_reverse1": bool(getattr(state,'file_browser_reverse1',False)),
-                                    "fb_view0": getattr(state,'file_browser_view0',None),
-                                    "fb_view1": getattr(state,'file_browser_view1',None),
-                                }
-                            })
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-                continue
-            # Settings modal (F1)
-            if ch == getattr(curses, 'KEY_F1', 0):
-                try:
-                    state.file_browser_settings_mode = True
-                    state.file_browser_settings_side = int(getattr(state, 'file_browser_side', 0))
-                except Exception:
-                    state.file_browser_settings_mode = True
-                    state.file_browser_settings_side = 0
-                continue
-            # Top menu open/close via F9
-            if ch == getattr(curses, 'KEY_F9', 0):
-                state.file_browser_menu_mode = not bool(getattr(state, 'file_browser_menu_mode', False))
-                if state.file_browser_menu_mode:
-                    state.file_browser_menu_top = 0
-                    state.file_browser_menu_index = 0
-                continue
-            # View menu interactions
-            if getattr(state, 'file_browser_view_mode', False):
-                if ch in ('\x1b',) or ch == 27:
-                    state.file_browser_view_mode = False
-                    continue
-                if ch in (curses.KEY_UP,):
-                    n = 5
-                    state.file_browser_view_index = (state.file_browser_view_index - 1) % n
-                    continue
-                if ch in (curses.KEY_DOWN,):
-                    n = 5
-                    state.file_browser_view_index = (state.file_browser_view_index + 1) % n
-                    continue
-                if ch in ('\n','\r') or ch in (curses.KEY_ENTER, 13):
-                    try:
-                        if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                            st = state.file_browser_state
-                            side = int(getattr(st, 'side', 0))
-                            sel = int(getattr(state, 'file_browser_view_index', 0))
-                            # 0: Имя А→Я, 1: Имя Я→А, 2: Дата новые, 3: Дата старые, 4: Папки впереди toggle
-                            if sel == 0:
-                                if side == 0:
-                                    st.sort0, st.reverse0 = 'name', False
-                                else:
-                                    st.sort1, st.reverse1 = 'name', False
-                            elif sel == 1:
-                                if side == 0:
-                                    st.sort0, st.reverse0 = 'name', True
-                                else:
-                                    st.sort1, st.reverse1 = 'name', True
-                            elif sel == 2:
-                                if side == 0:
-                                    st.sort0, st.reverse0 = 'mtime', True
-                                else:
-                                    st.sort1, st.reverse1 = 'mtime', True
-                            elif sel == 3:
-                                if side == 0:
-                                    st.sort0, st.reverse0 = 'mtime', False
-                                else:
-                                    st.sort1, st.reverse1 = 'mtime', False
-                            elif sel == 4:
-                                if side == 0:
-                                    st.dirs_first0 = not bool(st.dirs_first0)
-                                else:
-                                    st.dirs_first1 = not bool(st.dirs_first1)
-                            # Relist active pane with new prefs
-                            if side == 0:
-                                st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0)
-                                st.index0 = min(st.index0, len(st.items0)-1) if st.items0 else 0
-                            else:
-                                st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1)
-                                st.index1 = min(st.index1, len(st.items1)-1) if st.items1 else 0
-                        state.file_browser_view_mode = False
-                    except Exception:
-                        state.file_browser_view_mode = False
-                    continue
-            # Top menu interactions
-            if getattr(state, 'file_browser_menu_mode', False):
-                # Left/right switch top menu category
-                if ch == curses.KEY_LEFT:
-                    state.file_browser_menu_top = (int(getattr(state, 'file_browser_menu_top', 0)) - 1) % 3
-                    state.file_browser_menu_index = 0
-                    continue
-                if ch == curses.KEY_RIGHT:
-                    state.file_browser_menu_top = (int(getattr(state, 'file_browser_menu_top', 0)) + 1) % 3
-                    state.file_browser_menu_index = 0
-                    continue
-                if ch == curses.KEY_UP:
-                    state.file_browser_menu_index = max(0, int(getattr(state, 'file_browser_menu_index', 0)) - 1)
-                    continue
-                if ch == curses.KEY_DOWN:
-                    # recompute items count for bounds
-                    top = int(getattr(state, 'file_browser_menu_top', 0))
-                    cnt = 2 if top in (0,2) else 6
-                    state.file_browser_menu_index = min(cnt - 1, int(getattr(state, 'file_browser_menu_index', 0)) + 1)
-                    continue
-                if ch in ('\x1b',) or ch == 27:
-                    state.file_browser_menu_mode = False
-                    continue
-                if ch in ('\n','\r') or ch in (curses.KEY_ENTER, 13):
-                    # Execute selection
-                    try:
-                        top = int(getattr(state, 'file_browser_menu_top', 0))
-                        idx = int(getattr(state, 'file_browser_menu_index', 0))
-                        # Build current items like in draw
-                        if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                            st = state.file_browser_state
-                            side = 0 if top == 0 else (1 if top == 2 else int(getattr(st, 'side', 0)))
-                            sh = getattr(st, 'show_hidden0' if side == 0 else 'show_hidden1', True)
-                        else:
-                            # Fallback state (no module): decide target pane from the chosen top tab or current side
-                            st = None
-                            side = 0 if top == 0 else (1 if top == 2 else int(getattr(state, 'file_browser_side', 0)))
-                            try:
-                                sh = bool(getattr(state, 'file_browser_show_hidden0', True)) if side == 0 else bool(getattr(state, 'file_browser_show_hidden1', True))
-                            except Exception:
-                                sh = True
-                        if top in (0,2):
-                            items = [
-                                f"Показать скрытые файлы: {'Выкл' if sh else 'Вкл'}",
-                                "Обновить",
-                            ]
-                        else:
-                            items = [
-                                f"Сортировать: Дата создания",
-                                f"Сортировать: Дата редактирования",
-                                f"Сортировать: Дата добавления",
-                                "Вид: по папкам",
-                                "Вид: по файлам",
-                                "Вид: все",
-                            ]
-                        lab = items[max(0, min(len(items)-1, idx))]
-                        if top in (0,2):
-                            if lab.startswith('Показать скрытые файлы'):
-                                if st is not None:
-                                    if side == 0:
-                                        st.show_hidden0 = not bool(st.show_hidden0)
-                                        st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0, view=st.view0)
-                                        st.side = 0
-                                    else:
-                                        st.show_hidden1 = not bool(st.show_hidden1)
-                                        st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1, view=st.view1)
-                                        st.side = 1
-                                else:
-                                    # Fallback state — update the correct pane based on resolved side
-                                    if side == 0:
-                                        state.file_browser_show_hidden0 = not bool(getattr(state, 'file_browser_show_hidden0', True))
-                                        base = state.file_browser_path0 or str(_Path('.').resolve())
-                                        items = _list_dir(base, 0)
-                                        if not state.file_browser_show_hidden0:
-                                            items = [(n, d) for (n, d) in items if (n == '..' or not n.startswith('.'))]
-                                        state.file_browser_items0 = items
-                                    else:
-                                        state.file_browser_show_hidden1 = not bool(getattr(state, 'file_browser_show_hidden1', True))
-                                        base = state.file_browser_path1 or str(_Path('.').resolve())
-                                        items = _list_dir(base, 1)
-                                        if not state.file_browser_show_hidden1:
-                                            items = [(n, d) for (n, d) in items if (n == '..' or not n.startswith('.'))]
-                                        state.file_browser_items1 = items
-                            elif lab == 'Обновить':
-                                if st is not None:
-                                    if side == 0:
-                                        st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0, view=st.view0)
-                                        st.side = 0
-                                    else:
-                                        st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1, view=st.view1)
-                                        st.side = 1
-                                else:
-                                    # Nothing to do, items already rebuilt
-                                    pass
-                        else:
-                            # View menu actions — применяем к обеим панелям
-                            if st is not None:
-                                if lab.endswith('Дата создания'):
-                                    st.sort0, st.reverse0 = 'created', True
-                                    st.sort1, st.reverse1 = 'created', True
-                                elif lab.endswith('Дата редактирования'):
-                                    st.sort0, st.reverse0 = 'modified', True
-                                    st.sort1, st.reverse1 = 'modified', True
-                                elif lab.endswith('Дата добавления'):
-                                    st.sort0, st.reverse0 = 'added', True
-                                    st.sort1, st.reverse1 = 'added', True
-                                elif lab.endswith('по папкам'):
-                                    st.view0 = 'dirs'; st.view1 = 'dirs'
-                                elif lab.endswith('по файлам'):
-                                    st.view0 = 'files'; st.view1 = 'files'
-                                elif lab.endswith('все'):
-                                    st.view0 = None; st.view1 = None
-                                # Relist both panes
-                                st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0, view=st.view0)
-                                st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1, view=st.view1)
-                                st.index0 = min(st.index0, len(st.items0)-1) if st.items0 else 0
-                                st.index1 = min(st.index1, len(st.items1)-1) if st.items1 else 0
-                            else:
-                                # Fallback view actions: update fallback fields only (rendering uses file list as-is)
-                                if lab.endswith('Дата создания'):
-                                    state.file_browser_sort0, state.file_browser_reverse0 = 'created', True
-                                    state.file_browser_sort1, state.file_browser_reverse1 = 'created', True
-                                elif lab.endswith('Дата редактирования'):
-                                    state.file_browser_sort0, state.file_browser_reverse0 = 'modified', True
-                                    state.file_browser_sort1, state.file_browser_reverse1 = 'modified', True
-                                elif lab.endswith('Дата добавления'):
-                                    state.file_browser_sort0, state.file_browser_reverse0 = 'added', True
-                                    state.file_browser_sort1, state.file_browser_reverse1 = 'added', True
-                                elif lab.endswith('по папкам'):
-                                    state.file_browser_view0 = 'dirs'; state.file_browser_view1 = 'dirs'
-                                elif lab.endswith('по файлам'):
-                                    state.file_browser_view0 = 'files'; state.file_browser_view1 = 'files'
-                                elif lab.endswith('все'):
-                                    state.file_browser_view0 = None; state.file_browser_view1 = None
-                        # Persist after change
-                        if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                            _save_fb_prefs(state.file_browser_state)
-                            try:
-                                st = state.file_browser_state
-                                net.send({
-                                    "type": getattr(T,'PREFS_SET','prefs_set'),
-                                    "values": {
-                                        "fb_show_hidden0": bool(getattr(st,'show_hidden0',True)),
-                                        "fb_show_hidden1": bool(getattr(st,'show_hidden1',True)),
-                                        "fb_sort0": str(getattr(st,'sort0','name')),
-                                        "fb_sort1": str(getattr(st,'sort1','name')),
-                                        "fb_dirs_first0": bool(getattr(st,'dirs_first0',False)),
-                                        "fb_dirs_first1": bool(getattr(st,'dirs_first1',False)),
-                                        "fb_reverse0": bool(getattr(st,'reverse0',False)),
-                                        "fb_reverse1": bool(getattr(st,'reverse1',False)),
-                                        "fb_view0": getattr(st,'view0',None),
-                                        "fb_view1": getattr(st,'view1',None),
-                                    }
-                                })
-                            except Exception:
-                                pass
-                        else:
-                            _save_fb_prefs_values(
-                                fb_show_hidden0=bool(getattr(state, 'file_browser_show_hidden0', True)),
-                                fb_show_hidden1=bool(getattr(state, 'file_browser_show_hidden1', True)),
-                                fb_sort0=str(getattr(state, 'file_browser_sort0', 'name')),
-                                fb_sort1=str(getattr(state, 'file_browser_sort1', 'name')),
-                                fb_dirs_first0=bool(getattr(state, 'file_browser_dirs_first0', False)),
-                                fb_dirs_first1=bool(getattr(state, 'file_browser_dirs_first1', False)),
-                                fb_reverse0=bool(getattr(state, 'file_browser_reverse0', False)),
-                                fb_reverse1=bool(getattr(state, 'file_browser_reverse1', False)),
-                                fb_view0=getattr(state, 'file_browser_view0', None),
-                                fb_view1=getattr(state, 'file_browser_view1', None),
-                                fb_path0=str(getattr(state, 'file_browser_path0', '') or ''),
-                                fb_path1=str(getattr(state, 'file_browser_path1', '') or ''),
-                                fb_side=int(getattr(state, 'file_browser_side', 0)),
-                            )
-                            try:
-                                net.send({
-                                    "type": getattr(T,'PREFS_SET','prefs_set'),
-                                    "values": {
-                                        "fb_show_hidden0": bool(getattr(state,'file_browser_show_hidden0',True)),
-                                        "fb_show_hidden1": bool(getattr(state,'file_browser_show_hidden1',True)),
-                                        "fb_sort0": str(getattr(state,'file_browser_sort0','name')),
-                                        "fb_sort1": str(getattr(state,'file_browser_sort1','name')),
-                                        "fb_dirs_first0": bool(getattr(state,'file_browser_dirs_first0',False)),
-                                        "fb_dirs_first1": bool(getattr(state,'file_browser_dirs_first1',False)),
-                                        "fb_reverse0": bool(getattr(state,'file_browser_reverse0',False)),
-                                        "fb_reverse1": bool(getattr(state,'file_browser_reverse1',False)),
-                                        "fb_view0": getattr(state,'file_browser_view0',None),
-                                        "fb_view1": getattr(state,'file_browser_view1',None),
-                                    }
-                                })
-                            except Exception:
-                                pass
-                        # Status hint
-                        try:
-                            state.status = f"Меню: применено — {lab}"
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                    state.file_browser_menu_mode = False
-                    continue
-            # Navigate
-            if ch in ('k',) or ch == curses.KEY_UP:
-                try:
-                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                        st, chosen = fb_handle(state.file_browser_state, 'UP')
-                        state.file_browser_state = st
-                    else:
-                        side = int(getattr(state, 'file_browser_side', 0))
-                        if side == 0:
-                            n = len(state.file_browser_items0)
-                            if n > 0:
-                                state.file_browser_index0 = (state.file_browser_index0 - 1) % n
-                        else:
-                            n = len(state.file_browser_items1)
-                            if n > 0:
-                                state.file_browser_index1 = (state.file_browser_index1 - 1) % n
-                except Exception:
-                    pass
-                continue
-            if ch in ('j',) or ch == curses.KEY_DOWN:
-                try:
-                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                        st, chosen = fb_handle(state.file_browser_state, 'DOWN')
-                        state.file_browser_state = st
-                    else:
-                        side = int(getattr(state, 'file_browser_side', 0))
-                        if side == 0:
-                            n = len(state.file_browser_items0)
-                            if n > 0:
-                                state.file_browser_index0 = (state.file_browser_index0 + 1) % n
-                        else:
-                            n = len(state.file_browser_items1)
-                            if n > 0:
-                                state.file_browser_index1 = (state.file_browser_index1 + 1) % n
-                except Exception:
-                    pass
-                continue
-            # Switch pane with Tab (also support KEY_BTAB)
-            if (not getattr(state, 'file_browser_menu_mode', False)) and (not getattr(state, 'file_browser_view_mode', False)) and (
-                ch in ('\t', getattr(curses, 'KEY_BTAB', -9999), getattr(curses, 'KEY_TAB', -9999), 9)
-                or ch == getattr(curses, 'KEY_STAB', -9999)
-            ):
-                try:
-                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                        st, _ = fb_handle(state.file_browser_state, 'TAB')
-                        state.file_browser_state = st
-                        state.file_browser_side = int(getattr(st, 'side', 0))
-                    else:
-                        state.file_browser_side = 1 - int(getattr(state, 'file_browser_side', 0))
-                    try:
-                        _persist_file_browser_state(state)  # type: ignore[name-defined]
-                    except Exception:
-                        pass
-                except Exception:
-                    state.file_browser_side = 0
-                continue
-            # Open dir / choose file
-            if (not getattr(state, 'file_browser_menu_mode', False)) and (not getattr(state, 'file_browser_view_mode', False)) and ((isinstance(ch, str) and ch in ('\n', '\r')) or ch in (curses.KEY_ENTER, 13, curses.KEY_RIGHT)):
-                try:
-                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                        st, chosen = fb_handle(state.file_browser_state, 'ENTER')
-                        state.file_browser_state = st
-                        if chosen:
-                            try:
-                                sp = str(_Path(chosen).expanduser().resolve())
-                            except Exception:
-                                try:
-                                    sp = str(chosen)
-                                except Exception:
-                                    sp = ''
-                            if sp:
-                                txt = f"/file {sp}"
-                                try:
-                                    state.input_buffer = txt
-                                    state.input_caret = len(txt)
-                                except Exception:
-                                    state.input_buffer = txt
-                                state.status = f"Выбран файл: {sp}"
-                            # In любом случае закрываем модалку после выбора
-                            close_file_browser(state)  # type: ignore[name-defined]
-                        else:
-                            try:
-                                _persist_file_browser_state(state)  # type: ignore[name-defined]
-                            except Exception:
-                                pass
-                        continue
-                    else:
-                        side = int(getattr(state, 'file_browser_side', 0))
-                        if side == 0:
-                            idx = max(0, min(len(state.file_browser_items0) - 1, int(getattr(state, 'file_browser_index0', 0))))
-                            name, is_dir = state.file_browser_items0[idx]
-                            cur = state.file_browser_path0
-                        else:
-                            idx = max(0, min(len(state.file_browser_items1) - 1, int(getattr(state, 'file_browser_index1', 0))))
-                            name, is_dir = state.file_browser_items1[idx]
-                            cur = state.file_browser_path1
-                        if is_dir:
-                            nxt = _os.path.join(cur, name) if name != '..' else (_os.path.dirname(cur.rstrip(_os.sep)) or cur)
-                            if _os.path.isdir(nxt):
-                                if side == 0:
-                                    state.file_browser_path0 = nxt
-                                    state.file_browser_items0 = _list_dir(nxt, 0)
-                                    state.file_browser_index0 = 0
-                                else:
-                                    state.file_browser_path1 = nxt
-                                    state.file_browser_items1 = _list_dir(nxt, 1)
-                                    state.file_browser_index1 = 0
-                                state.status = f"Файлы: {nxt}"
-                                try:
-                                    _persist_file_browser_state(state)  # type: ignore[name-defined]
-                                except Exception:
-                                    pass
-                            continue
-                        else:
-                            try:
-                                sp = str(_Path(_os.path.join(cur, name)).expanduser().resolve())
-                            except Exception:
-                                sp = _os.path.join(cur, name)
-                            txt = f"/file {sp}"
-                            try:
-                                state.input_buffer = txt
-                                state.input_caret = len(txt)
-                            except Exception:
-                                state.input_buffer = txt
-                            close_file_browser(state)  # type: ignore[name-defined]
-                            state.status = f"Выбран файл: {sp}"
-                            continue
-                except Exception:
-                    # В случае любой ошибки — мягко закрываем модалку, не теряя ввод
-                    try:
-                        state.status = "Ошибка выбора файла"
-                    except Exception:
-                        pass
-                    close_file_browser(state)  # type: ignore[name-defined]
-            # Parent dir via Backspace/Left
-            if (not getattr(state, 'file_browser_menu_mode', False)) and (not getattr(state, 'file_browser_view_mode', False)) and (ch in (curses.KEY_BACKSPACE, curses.KEY_LEFT)):
-                try:
-                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                        st, _ = fb_handle(state.file_browser_state, 'BACKSPACE')
-                        state.file_browser_state = st
-                        try:
-                            _persist_file_browser_state(state)  # type: ignore[name-defined]
-                        except Exception:
-                            pass
-                    else:
-                        side = int(getattr(state, 'file_browser_side', 0))
-                        cur = (state.file_browser_path0 if side == 0 else state.file_browser_path1) or str(_Path('.').resolve())
-                        nxt = _os.path.dirname(cur.rstrip(_os.sep)) or cur
-                        if nxt and _os.path.isdir(nxt) and nxt != cur:
-                            if side == 0:
-                                state.file_browser_path0 = nxt
-                                state.file_browser_items0 = _list_dir(nxt, 0)
-                                state.file_browser_index0 = 0
-                            else:
-                                state.file_browser_path1 = nxt
-                                state.file_browser_items1 = _list_dir(nxt, 1)
-                                state.file_browser_index1 = 0
-                            state.status = f"Файлы: {nxt}"
-                    try:
-                        _persist_file_browser_state(state)  # type: ignore[name-defined]
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-                continue
-            # Mouse inside file browser modal (top menu, selection, double-click, wheel)
-            # Global SGR mouse fallback (macOS Terminal/iTerm2) when curses doesn't map to KEY_MOUSE
-            if isinstance(ch, str) and ch.startswith('\x1b[<'):
-                try:
-                    import re as _re
-                    m = _re.match(r"\x1b\[<(?P<b>\d+);(?P<x>\d+);(?P<y>\d+)(?P<t>[Mm])", ch)
-                    if not m:
-                        m = _re.match(r"\x1b\[(?P<b>\d+);(?P<x>\d+);(?P<y>\d+)(?P<t>[Mm])", ch)
-                    if m:
-                        Cb = int(m.group('b'))
-                        mx = int(m.group('x')) - 1
-                        my = int(m.group('y')) - 1
-                        is_press = (m.group('t') == 'M')
-                        # Map to wheel/click masks similar to curses
-                        wheel_up, wheel_down = _compute_wheel_masks()
-                        bstate = 0
-                        if (Cb & 0x40) and (Cb & 1) == 0:
-                            bstate |= wheel_up
-                        elif (Cb & 0x40) and (Cb & 1) == 1:
-                            bstate |= wheel_down
-                        else:
-                            if is_press:
-                                bstate |= getattr(curses, 'BUTTON1_PRESSED', 0) or getattr(curses, 'BUTTON1_CLICKED', 0)
-                            else:
-                                bstate |= getattr(curses, 'BUTTON1_RELEASED', 0) or getattr(curses, 'BUTTON1_CLICKED', 0)
-                        # Apply the same logic as KEY_MOUSE for the main UI
-                        try:
-                            h, w = stdscr.getmaxyx()
-                            left_w = max(20, min(30, w // 4))
-                        except Exception:
-                            left_w = 20
-                        in_left = (mx < left_w)
-                        if bstate & wheel_up:
-                            if in_left:
-                                rows_cnt = len(build_contact_rows(state))
-                                vis = int(getattr(state, 'last_left_h', 10))
-                                max_start = max(0, rows_cnt - max(0, vis))
-                                cs = max(0, int(getattr(state, 'contacts_scroll', 0)) - 3)
-                                state.contacts_scroll = max(0, min(cs, max_start))
-                                need_redraw = True
-                                try:
-                                    if state.selected_index < cs:
-                                        state.selected_index = cs
-                                    elif state.selected_index >= cs + max(1, vis):
-                                        state.selected_index = cs + max(1, vis) - 1
-                                        clamp_selection(state, prefer='up')
-                                except Exception:
-                                    pass
-                            else:
-                                state.history_scroll += 3
-                                _clamp_history_scroll(state)
-                                need_redraw = True
-                            continue
-                        if bstate & wheel_down:
-                            if in_left:
-                                rows_cnt = len(build_contact_rows(state))
-                                vis = int(getattr(state, 'last_left_h', 10))
-                                max_start = max(0, rows_cnt - max(0, vis))
-                                cs = min(max_start, int(getattr(state, 'contacts_scroll', 0)) + 3)
-                                state.contacts_scroll = max(0, min(cs, max_start))
-                                need_redraw = True
-                                try:
-                                    if state.selected_index < cs:
-                                        state.selected_index = cs
-                                    elif state.selected_index >= cs + max(1, vis):
-                                        state.selected_index = cs + max(1, vis) - 1
-                                        clamp_selection(state, prefer='down')
-                                except Exception:
-                                    pass
-                            else:
-                                state.history_scroll = max(0, state.history_scroll - 3)
-                                _clamp_history_scroll(state)
-                                need_redraw = True
-                            continue
-                        # Left pane click selection (similar to KEY_MOUSE contact selection)
-                        if in_left:
-                            # Map to contacts region (align with draw: start_y=2)
-                            start_y = 2
-                            try:
-                                h, w = stdscr.getmaxyx()
-                                vis_h = max(0, h - start_y - 2)
-                            except Exception:
-                                vis_h = 10
-                            rows = build_contact_rows(state)
-                            cs = max(0, int(getattr(state, 'contacts_scroll', 0)))
-                            max_rows = min(max(0, len(rows) - cs), vis_h)
-                            if start_y <= my < start_y + max_rows:
-                                local_idx = my - start_y
-                                idx = cs + local_idx
-                                if 0 <= idx < len(rows):
-                                    state.selected_index = idx
-                                    clamp_selection(state, prefer='down')
-                                    sel = current_selected_id(state)
-                                    # Auto mark as read
-                                    _maybe_send_message_read(state, net, sel)
-                                    state.history_scroll = 0
-                            continue
-                        # history area selection/copy is intentionally left to terminal or existing logic
-                except Exception:
-                    pass
-            if ch == curses.KEY_MOUSE:
-                try:
-                    _mid, mx, my, _mz, bstate = curses.getmouse()
-                    if KEYLOG_ENABLED or getattr(state, 'debug_mode', False):
-                        _dbg(f"[mouse] KEY_MOUSE mx={mx} my={my} bstate={bstate}")
-                except Exception:
-                    continue
-                # Header hotkeys hit-testing (y == 0)
-                if my == 0:
-                    if handle_hotkey_click(mx, my):
-                        continue
-                    continue
-                try:
-                    if KEYLOG_ENABLED or getattr(state, 'debug_mode', False):
-                        state.debug_last_mouse = f"KEY_MOUSE x={mx} y={my} bstate={bstate}"
-                        try:
-                            state.debug_lines.append(state.debug_last_mouse)
-                            if len(state.debug_lines) > 300:
-                                del state.debug_lines[:len(state.debug_lines) - 300]
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                # Geometry same as renderer
-                try:
-                    h, w = stdscr.getmaxyx()
-                    # Top menu bar click (use exact label geometry if available)
-                    if my == 0:
-                        top = None
-                        try:
-                            pos = list(getattr(state, 'file_browser_menu_pos', []) or [])
-                            for i, (xs, xe) in enumerate(pos[:3]):
-                                if xs <= mx < xe:
-                                    top = i
-                                    break
-                        except Exception:
-                            top = None
-                        if top is None:
-                            # Fallback to rough thirds
-                            seg = max(1, w // 3)
-                            top = min(2, max(0, mx // seg))
-                        state.file_browser_menu_mode = True
-                        state.file_browser_menu_top = top
-                        state.file_browser_menu_index = 0
-                        continue
-                    split_x = max(1, w // 2)
-                    pane_w0 = max(8, split_x - 1)
-                    pane_w1 = max(8, w - split_x - 1)
-                    list_top = 3
-                    # Determine pane by x coordinate
-                    side = 0 if mx < split_x else 1
-                    sep_y = max(0, h - 2)
-                    list_rows = max(1, sep_y - list_top - 2)
-                except Exception:
-                    continue
-                # Prepare data and compute window starts (mirror SGR branch)
-                try:
-                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                        st = state.file_browser_state
-                        idx0 = int(getattr(st, 'index0', 0)); idx1 = int(getattr(st, 'index1', 0))
-                        items0 = list(getattr(st, 'items0', []) or [])
-                        items1 = list(getattr(st, 'items1', []) or [])
-                        start0 = fb_window(idx0, len(items0), list_rows)
-                        start1 = fb_window(idx1, len(items1), list_rows)
-                    else:
-                        idx0 = int(getattr(state, 'file_browser_index0', 0)); idx1 = int(getattr(state, 'file_browser_index1', 0))
-                        items0 = list(getattr(state, 'file_browser_items0', []) or [])
-                        items1 = list(getattr(state, 'file_browser_items1', []) or [])
-                        start0 = max(0, min(idx0 - list_rows // 2, max(0, len(items0) - list_rows)))
-                        start1 = max(0, min(idx1 - list_rows // 2, max(0, len(items1) - list_rows)))
-                except Exception:
-                    continue
-                # Wheel support
-                try:
-                    wheel_up, wheel_down = _compute_wheel_masks()
-                except Exception:
-                    wheel_up = wheel_down = 0
-                b4_mask = (
-                    getattr(curses, 'BUTTON4_PRESSED', 0)
-                    | getattr(curses, 'BUTTON4_CLICKED', 0)
-                    | getattr(curses, 'BUTTON4_RELEASED', 0)
-                    | getattr(curses, 'BUTTON4_DOUBLE_CLICKED', 0)
-                    | getattr(curses, 'BUTTON4_TRIPLE_CLICKED', 0)
-                )
-                b5_mask = (
-                    getattr(curses, 'BUTTON5_PRESSED', 0)
-                    | getattr(curses, 'BUTTON5_CLICKED', 0)
-                    | getattr(curses, 'BUTTON5_RELEASED', 0)
-                    | getattr(curses, 'BUTTON5_DOUBLE_CLICKED', 0)
-                    | getattr(curses, 'BUTTON5_TRIPLE_CLICKED', 0)
-                )
-                up_event = bool(bstate & wheel_up) or (wheel_up == 0 and bool(bstate & b4_mask))
-                down_event = bool(bstate & wheel_down) or (wheel_down == 0 and bool(bstate & b5_mask))
-                if up_event:
-                    try:
-                        delta = 3
-                        if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                            st.index0 = max(0, st.index0 - delta) if side == 0 else st.index0
-                            st.index1 = max(0, st.index1 - delta) if side == 1 else st.index1
-                        else:
-                            if side == 0 and items0:
-                                state.file_browser_index0 = max(0, state.file_browser_index0 - delta)
-                            if side == 1 and items1:
-                                state.file_browser_index1 = max(0, state.file_browser_index1 - delta)
-                    except Exception:
-                        pass
-                    continue
-                if down_event:
-                    try:
-                        delta = 3
-                        if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                            st.index0 = min(len(items0)-1, st.index0 + delta) if side == 0 and items0 else st.index0
-                            st.index1 = min(len(items1)-1, st.index1 + delta) if side == 1 and items1 else st.index1
-                        else:
-                            if side == 0 and items0:
-                                state.file_browser_index0 = min(len(items0)-1, state.file_browser_index0 + delta)
-                            if side == 1 and items1:
-                                state.file_browser_index1 = min(len(items1)-1, state.file_browser_index1 + delta)
-                    except Exception:
-                        pass
-                    continue
-                # Click inside input box to reposition caret
-                try:
-                    sep_y = max(0, h - 2)
-                    hist_y = 1
-                    hist_h = max(0, sep_y - hist_y - 2)
-                    input_y = hist_y + hist_h
-                    if side == 1 and (input_y + 1) <= my <= (sep_y - 1):
-                        # Geometry matches renderer
-                        hist_x = split_x + 1
-                        hist_w = max(1, w - hist_x - 1)
-                        width = max(1, hist_w - 2)
-                        txt = getattr(state, 'input_buffer', '') or ''
-                        # Map click to wrapped row/col
-                        target_row = max(0, my - (input_y + 1))
-                        target_col = max(0, mx - hist_x - 1)
-                        # Precompute caret positions for each index (0..len)
-                        positions = []
-                        row = 0
-                        col = 0
-                        positions.append((row, col))  # caret at position 0
-                        for ch in txt:
-                            if ch == '\n':
-                                row += 1
-                                col = 0
-                                positions.append((row, col))
-                                continue
-                            col += 1
-                            if col >= width:
-                                row += 1
-                                col = 0
-                            positions.append((row, col))
-                        # Pick caret with minimal distance to click (row/col)
-                        best_idx = 0
-                        best_score = 1e9
-                        for idx, (r, c) in enumerate(positions):
-                            score = abs(r - target_row) * width + abs(c - target_col)
-                            if score < best_score:
-                                best_score = score
-                                best_idx = idx
-                        caret = best_idx
-                        try:
-                            state.input_caret = caret
-                            state.input_sel_start = caret
-                            state.input_sel_end = caret
-                            state.input_cursor_visible = True
-                            state.input_cursor_last_toggle = time.time()
-                        except Exception:
-                            pass
-                        continue
-                except Exception:
-                    pass
-                # Click inside dropdown menu to select/activate (mirror SGR)
-                if getattr(state, 'file_browser_menu_mode', False):
-                    try:
-                        top = int(getattr(state, 'file_browser_menu_top', 0))
-                        if top == 0:
-                            box_w = max(26, min(40, pane_w0 - 2)); x0 = 0; items_cnt = 2
-                        elif top == 2:
-                            box_w = max(26, min(40, pane_w1 - 2)); x0 = split_x + 1; items_cnt = 2
-                        else:
-                            box_w = max(30, min(48, w - 4)); x0 = max(0, (w - box_w)//2); items_cnt = 6
-                        y0 = 1
-                        inside = (y0 <= my <= y0 + 1 + items_cnt) and (x0 <= mx < x0 + box_w)
-                        if inside:
-                            row = my - (y0 + 1)
-                            if 0 <= row < items_cnt:
-                                state.file_browser_menu_index = row
-                                try:
-                                    idx = row
-                                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                        st = state.file_browser_state
-                                        # Bind panel to actual mouse X position to avoid mis-detected top on macOS
-                                        side2 = 0 if mx < split_x else 1
-                                        sh = getattr(st, 'show_hidden0' if side2 == 0 else 'show_hidden1', True)
-                                    else:
-                                            st = None; side2 = 0; sh = bool(getattr(state, 'file_browser_show_hidden0', True))
-                                    if top in (0,2):
-                                        items_menu = [
-                                            f"Показать скрытые файлы: {'Выкл' if sh else 'Вкл'}",
-                                            "Обновить",
-                                        ]
-                                    else:
-                                        items_menu = [
-                                            f"Сортировать: Дата создания",
-                                            f"Сортировать: Дата редактирования",
-                                            f"Сортировать: Дата добавления",
-                                            "Вид: по папкам",
-                                            "Вид: по файлам",
-                                            "Вид: все",
-                                        ]
-                                    lab = items_menu[max(0, min(len(items_menu)-1, idx))]
-                                    if top in (0,2):
-                                        if lab.startswith('Показать скрытые файлы'):
-                                            if st is not None:
-                                                if side2 == 0:
-                                                    st.show_hidden0 = not bool(st.show_hidden0)
-                                                    st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0, view=st.view0)
-                                                    st.side = 0
-                                                else:
-                                                    st.show_hidden1 = not bool(st.show_hidden1)
-                                                    st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1, view=st.view1)
-                                                    st.side = 1
-                                            else:
-                                                if side2 == 0:
-                                                    state.file_browser_show_hidden0 = not bool(getattr(state, 'file_browser_show_hidden0', True))
-                                                    base = state.file_browser_path0 or str(_Path('.').resolve())
-                                                    its = _list_dir(base, 0)
-                                                    if not state.file_browser_show_hidden0:
-                                                        its = [(n,d) for (n,d) in its if (n=='..' or not n.startswith('.'))]
-                                                    state.file_browser_items0 = its
-                                                else:
-                                                    state.file_browser_show_hidden1 = not bool(getattr(state, 'file_browser_show_hidden1', True))
-                                                    base = state.file_browser_path1 or str(_Path('.').resolve())
-                                                    its = _list_dir(base, 1)
-                                                    if not state.file_browser_show_hidden1:
-                                                        its = [(n,d) for (n,d) in its if (n=='..' or not n.startswith('.'))]
-                                                    state.file_browser_items1 = its
-                                    elif lab == 'Обновить':
-                                        if st is not None:
-                                            if side2 == 0:
-                                                st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0, view=st.view0)
-                                                st.side = 0
-                                            else:
-                                                st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1, view=st.view1)
-                                                st.side = 1
-                                    else:
-                                        if st is not None:
-                                            if lab.endswith('Дата создания'):
-                                                st.sort0, st.reverse0 = 'created', True
-                                                st.sort1, st.reverse1 = 'created', True
-                                            elif lab.endswith('Дата редактирования'):
-                                                st.sort0, st.reverse0 = 'modified', True
-                                                st.sort1, st.reverse1 = 'modified', True
-                                            elif lab.endswith('Дата добавления'):
-                                                st.sort0, st.reverse0 = 'added', True
-                                                st.sort1, st.reverse1 = 'added', True
-                                            elif lab.endswith('по папкам'):
-                                                st.view0 = 'dirs'; st.view1 = 'dirs'
-                                            elif lab.endswith('по файлам'):
-                                                st.view0 = 'files'; st.view1 = 'files'
-                                            elif lab.endswith('все'):
-                                                st.view0 = None; st.view1 = None
-                                        else:
-                                            if lab.endswith('Дата создания'):
-                                                state.file_browser_sort0=state.file_browser_sort1='created'; state.file_browser_reverse0=state.file_browser_reverse1=True
-                                            elif lab.endswith('Дата редактирования'):
-                                                state.file_browser_sort0=state.file_browser_sort1='modified'; state.file_browser_reverse0=state.file_browser_reverse1=True
-                                            elif lab.endswith('Дата добавления'):
-                                                state.file_browser_sort0=state.file_browser_sort1='added'; state.file_browser_reverse0=state.file_browser_reverse1=True
-                                            elif lab.endswith('по папкам'):
-                                                state.file_browser_view0=state.file_browser_view1='dirs'
-                                            elif lab.endswith('по файлам'):
-                                                state.file_browser_view0=state.file_browser_view1='files'
-                                            elif lab.endswith('все'):
-                                                state.file_browser_view0=state.file_browser_view1=None
-                                except Exception:
-                                    pass
-                                state.file_browser_menu_mode = False
-                                continue
-                    except Exception:
-                        pass
-                # Click inside lists (select row; open on double-click or fast second click)
-                if list_top <= my < list_top + list_rows:
-                    try:
-                        row = my - list_top
-                        if side == 0 and items0:
-                            new_idx = max(0, min(len(items0)-1, start0 + row))
-                            if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                st.index0 = new_idx; st.side = 0
-                            else:
-                                state.file_browser_index0 = new_idx; state.file_browser_side = 0
-                        elif side == 1 and items1:
-                            new_idx = max(0, min(len(items1)-1, start1 + row))
-                            if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                st.index1 = new_idx; st.side = 1
-                            else:
-                                state.file_browser_index1 = new_idx; state.file_browser_side = 1
-                        # Determine open by double-click or fast second click on same row/side
-                        open_now = bool(bstate & getattr(curses, 'BUTTON1_DOUBLE_CLICKED', 0))
-                        try:
-                            import time as _t
-                            now = float(_t.time())
-                            last_ts = float(getattr(state, 'fb_last_click_ts', 0.0))
-                            last_side = int(getattr(state, 'fb_last_click_side', -1))
-                            last_row = int(getattr(state, 'fb_last_click_row', -1))
-                            cur_row = (start0 + row) if side == 0 else (start1 + row)
-                            # Treat as double if same row/side within 0.4s
-                            if (side == last_side) and (cur_row == last_row) and ((now - last_ts) <= 0.4):
-                                open_now = True
-                            # Update last click info
-                            state.fb_last_click_ts = now
-                            state.fb_last_click_side = side
-                            state.fb_last_click_row = cur_row
-                        except Exception:
-                            pass
-                        if open_now:
-                            if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                st2, chosen = fb_handle(state.file_browser_state, 'ENTER')
-                                state.file_browser_state = st2
-                                if chosen:
-                                    try:
-                                        sp = str(_Path(chosen).expanduser().resolve())
-                                    except Exception:
-                                        sp = str(chosen)
-                                    if sp:
-                                        txt = f"/file {sp}"
-                                        state.input_buffer = txt
-                                        state.input_caret = len(txt)
-                                        state.status = f"Выбран файл: {sp}"
-                                    close_file_browser(state)  # type: ignore[name-defined]
-                        else:
-                            # Fallback: compute current selection and open/choose
-                            if side == 0:
-                                idx = max(0, min(len(items0)-1, new_idx)); name, is_dir = items0[idx]; cur = state.file_browser_path0
-                            else:
-                                idx = max(0, min(len(items1)-1, new_idx)); name, is_dir = items1[idx]; cur = state.file_browser_path1
-                            if is_dir:
-                                nxt = _os.path.join(cur, name) if name != '..' else (_os.path.dirname(cur.rstrip(_os.sep)) or cur)
-                                if _os.path.isdir(nxt):
-                                    if side == 0:
-                                        state.file_browser_path0 = nxt; state.file_browser_items0 = _list_dir(nxt, 0); state.file_browser_index0 = 0
-                                    else:
-                                        state.file_browser_path1 = nxt; state.file_browser_items1 = _list_dir(nxt, 1); state.file_browser_index1 = 0
-                                    state.status = f"Файлы: {nxt}"
-                            else:
-                                try:
-                                    sp = str(_Path(_os.path.join(cur, name)).expanduser().resolve())
-                                except Exception:
-                                    sp = _os.path.join(cur, name)
-                                txt = f"/file {sp}"
-                                state.input_buffer = txt; state.input_caret = len(txt)
-                                state.status = f"Выбран файл: {sp}"
-                                close_file_browser(state)  # type: ignore[name-defined]
-                        continue
-                    except Exception:
-                        pass
-                # Click on header rows: set active pane even if not over list
-                else:
-                    try:
-                        if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                            st = state.file_browser_state
-                            st.side = 0 if mx < split_x else 1
-                        else:
-                            state.file_browser_side = 0 if mx < split_x else 1
-                    except Exception:
-                        pass
-            # SGR mouse fallback for terminals that don't map to KEY_MOUSE on macOS
-            if isinstance(ch, str) and ch.startswith('\x1b[<') and bool(getattr(state, 'mouse_enabled', False)):
-                try:
-                    # Format: ESC [ < Cb ; Cx ; Cy (M|m)
-                    s = ch
-                    # Extract numbers
-                    import re as _re
-                    m = _re.match(r"\x1b\[<(?P<b>\d+);(?P<x>\d+);(?P<y>\d+)(?P<t>[Mm])", s)
-                    if not m:
-                        # Some terminals send without '<'
-                        m = _re.match(r"\x1b\[(?P<b>\d+);(?P<x>\d+);(?P<y>\d+)(?P<t>[Mm])", s)
-                    if not m:
-                        pass
-                    else:
-                        Cb = int(m.group('b'))
-                        mx = int(m.group('x')) - 1
-                        my = int(m.group('y')) - 1
-                        is_press = (m.group('t') == 'M')
-                        # Map to curses bstate
-                        bstate = 0
-                        try:
-                            wheel_up, wheel_down = _compute_wheel_masks()
-                        except Exception:
-                            wheel_up = wheel_down = 0
-                        if (Cb & 0x40) and (Cb & 1) == 0:
-                            # Wheel up (typically 64)
-                            bstate |= wheel_up
-                        elif (Cb & 0x40) and (Cb & 1) == 1:
-                            # Wheel down (65)
-                            bstate |= wheel_down
-                        else:
-                            if is_press:
-                                bstate |= getattr(curses, 'BUTTON1_PRESSED', 0) or getattr(curses, 'BUTTON1_CLICKED', 0)
-                            else:
-                                bstate |= getattr(curses, 'BUTTON1_RELEASED', 0) or getattr(curses, 'BUTTON1_CLICKED', 0)
-                        # Reuse the same geometry/menu handling as KEY_MOUSE
-                        try:
-                            h, w = stdscr.getmaxyx()
-                            # Top menu bar click
-                            if my == 0:
-                                # Use remembered label positions if available
-                                top = None
-                                try:
-                                    pos = list(getattr(state, 'file_browser_menu_pos', []) or [])
-                                    for i, (xs, xe) in enumerate(pos[:3]):
-                                        if xs <= mx < xe:
-                                            top = i
-                                            break
-                                except Exception:
-                                    top = None
-                                if top is None:
-                                    seg = max(1, w // 3)
-                                    top = min(2, max(0, mx // seg))
-                                state.file_browser_menu_mode = True
-                                state.file_browser_menu_top = top
-                                state.file_browser_menu_index = 0
-                                continue
-                            split_x = max(1, w // 2)
-                            pane_w0 = max(8, split_x - 1)
-                            pane_w1 = max(8, w - split_x - 1)
-                            list_top = 3
-                            sep_y = max(0, h - 2)
-                            list_rows = max(1, sep_y - list_top - 2)
-                            # Determine pane
-                            side = 0 if mx < split_x else 1
-                            # Compute window starts
-                            if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                st = state.file_browser_state
-                                idx0 = int(getattr(st, 'index0', 0)); idx1 = int(getattr(st, 'index1', 0))
-                                items0 = list(getattr(st, 'items0', []) or [])
-                                items1 = list(getattr(st, 'items1', []) or [])
-                                start0 = fb_window(idx0, len(items0), list_rows)
-                                start1 = fb_window(idx1, len(items1), list_rows)
-                            else:
-                                idx0 = int(getattr(state, 'file_browser_index0', 0)); idx1 = int(getattr(state, 'file_browser_index1', 0))
-                                items0 = list(getattr(state, 'file_browser_items0', []) or [])
-                                items1 = list(getattr(state, 'file_browser_items1', []) or [])
-                                start0 = max(0, min(idx0 - list_rows // 2, max(0, len(items0) - list_rows)))
-                                start1 = max(0, min(idx1 - list_rows // 2, max(0, len(items1) - list_rows)))
-                            # If dropdown menu open: handle as in KEY_MOUSE
-                            if getattr(state, 'file_browser_menu_mode', False):
-                                top = int(getattr(state, 'file_browser_menu_top', 0))
-                                if top == 0:
-                                    box_w = max(26, min(40, pane_w0 - 2)); x0 = 0; items_cnt = 2
-                                elif top == 2:
-                                    box_w = max(26, min(40, pane_w1 - 2)); x0 = split_x + 1; items_cnt = 2
-                                else:
-                                    box_w = max(30, min(48, w - 4)); x0 = max(0, (w - box_w)//2); items_cnt = 6
-                                y0 = 1
-                                inside = (y0 <= my <= y0 + 1 + items_cnt) and (x0 <= mx < x0 + box_w)
-                                if inside:
-                                    row = my - (y0 + 1)
-                                    if 0 <= row < items_cnt:
-                                        state.file_browser_menu_index = row
-                                        # Применим пункт немедленно (как в KEY_MOUSE пути)
-                                        try:
-                                            idx = row
-                                            # Сформируем список пунктов как в отрисовке и применим
-                                            if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                                st = state.file_browser_state
-                                                # Bind panel to actual mouse X position to avoid mis-detected top on macOS
-                                                side2 = 0 if mx < split_x else 1
-                                                sh = getattr(st, 'show_hidden0' if side2 == 0 else 'show_hidden1', True)
-                                            else:
-                                                st = None; side2 = 0; sh = True
-                                            if top in (0,2):
-                                                items_menu = [
-                                                    f"Показать скрытые файлы: {'Выкл' if sh else 'Вкл'}",
-                                                    "Обновить",
-                                                ]
-                                            else:
-                                                items_menu = [
-                                                    f"Сортировать: Дата создания",
-                                                    f"Сортировать: Дата редактирования",
-                                                    f"Сортировать: Дата добавления",
-                                                    "Вид: по папкам",
-                                                    "Вид: по файлам",
-                                                    "Вид: все",
-                                                ]
-                                            lab = items_menu[max(0, min(len(items_menu)-1, idx))]
-                                            if top in (0,2):
-                                                if lab.startswith('Показать скрытые файлы'):
-                                                    if st is not None:
-                                                        if side2 == 0:
-                                                            st.show_hidden0 = not bool(st.show_hidden0)
-                                                            st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0, view=st.view0)
-                                                            st.side = 0
-                                                        else:
-                                                            st.show_hidden1 = not bool(st.show_hidden1)
-                                                            st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1, view=st.view1)
-                                                            st.side = 1
-                                                    else:
-                                                        if side2 == 0:
-                                                            state.file_browser_show_hidden0 = not bool(getattr(state, 'file_browser_show_hidden0', True))
-                                                            base = state.file_browser_path0 or str(_Path('.').resolve())
-                                                            its = _list_dir(base, 0)
-                                                            if not state.file_browser_show_hidden0:
-                                                                its = [(n,d) for (n,d) in its if (n=='..' or not n.startswith('.'))]
-                                                            state.file_browser_items0 = its
-                                                        else:
-                                                            state.file_browser_show_hidden1 = not bool(getattr(state, 'file_browser_show_hidden1', True))
-                                                            base = state.file_browser_path1 or str(_Path('.').resolve())
-                                                            its = _list_dir(base, 1)
-                                                            if not state.file_browser_show_hidden1:
-                                                                its = [(n,d) for (n,d) in its if (n=='..' or not n.startswith('.'))]
-                                                            state.file_browser_items1 = its
-                                                elif lab == 'Обновить':
-                                                    if st is not None:
-                                                        if side2 == 0:
-                                                            st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0, view=st.view0)
-                                                            st.side = 0
-                                                        else:
-                                                            st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1, view=st.view1)
-                                                            st.side = 1
-                                            else:
-                                                if st is not None:
-                                                    if lab.endswith('Дата создания'):
-                                                        st.sort0, st.reverse0 = 'created', True
-                                                        st.sort1, st.reverse1 = 'created', True
-                                                    elif lab.endswith('Дата редактирования'):
-                                                        st.sort0, st.reverse0 = 'modified', True
-                                                        st.sort1, st.reverse1 = 'modified', True
-                                                    elif lab.endswith('Дата добавления'):
-                                                        st.sort0, st.reverse0 = 'added', True
-                                                        st.sort1, st.reverse1 = 'added', True
-                                                    elif lab.endswith('по папкам'):
-                                                        st.view0 = 'dirs'; st.view1 = 'dirs'
-                                                    elif lab.endswith('по файлам'):
-                                                        st.view0 = 'files'; st.view1 = 'files'
-                                                    elif lab.endswith('все'):
-                                                        st.view0 = None; st.view1 = None
-                                                    st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0, view=st.view0)
-                                                    st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1, view=st.view1)
-                                                    st.index0 = min(st.index0, len(st.items0)-1) if st.items0 else 0
-                                                    st.index1 = min(st.index1, len(st.items1)-1) if st.items1 else 0
-                                                else:
-                                                    # Fallback: обновим только флаги
-                                                    if lab.endswith('Дата создания'):
-                                                        state.file_browser_sort0=state.file_browser_sort1='created'; state.file_browser_reverse0=state.file_browser_reverse1=True
-                                                    elif lab.endswith('Дата редактирования'):
-                                                        state.file_browser_sort0=state.file_browser_sort1='modified'; state.file_browser_reverse0=state.file_browser_reverse1=True
-                                                    elif lab.endswith('Дата добавления'):
-                                                        state.file_browser_sort0=state.file_browser_sort1='added'; state.file_browser_reverse0=state.file_browser_reverse1=True
-                                                    elif lab.endswith('по папкам'):
-                                                        state.file_browser_view0=state.file_browser_view1='dirs'
-                                                    elif lab.endswith('по файлам'):
-                                                        state.file_browser_view0=state.file_browser_view1='files'
-                                                    elif lab.endswith('все'):
-                                                        state.file_browser_view0=state.file_browser_view1=None
-                                            # Persist and sync prefs to server
-                                            try:
-                                                if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                                    st2 = state.file_browser_state
-                                                    _save_fb_prefs(st2)
-                                                    try:
-                                                        net.send({
-                                                            "type": getattr(T,'PREFS_SET','prefs_set'),
-                                                            "values": {
-                                                                "fb_show_hidden0": bool(getattr(st2,'show_hidden0',True)),
-                                                                "fb_show_hidden1": bool(getattr(st2,'show_hidden1',True)),
-                                                                "fb_sort0": str(getattr(st2,'sort0','name')),
-                                                                "fb_sort1": str(getattr(st2,'sort1','name')),
-                                                                "fb_dirs_first0": bool(getattr(st2,'dirs_first0',False)),
-                                                                "fb_dirs_first1": bool(getattr(st2,'dirs_first1',False)),
-                                                                "fb_reverse0": bool(getattr(st2,'reverse0',False)),
-                                                                "fb_reverse1": bool(getattr(st2,'reverse1',False)),
-                                                                "fb_view0": getattr(st2,'view0',None),
-                                                                "fb_view1": getattr(st2,'view1',None),
-                                                            }
-                                                        })
-                                                    except Exception:
-                                                        pass
-                                                else:
-                                                    _save_fb_prefs_values(
-                                                        fb_show_hidden0=bool(getattr(state, 'file_browser_show_hidden0', True)),
-                                                        fb_show_hidden1=bool(getattr(state, 'file_browser_show_hidden1', True)),
-                                                        fb_sort0=str(getattr(state, 'file_browser_sort0', 'name')),
-                                                        fb_sort1=str(getattr(state, 'file_browser_sort1', 'name')),
-                                                        fb_dirs_first0=bool(getattr(state, 'file_browser_dirs_first0', False)),
-                                                        fb_dirs_first1=bool(getattr(state, 'file_browser_dirs_first1', False)),
-                                                        fb_reverse0=bool(getattr(state, 'file_browser_reverse0', False)),
-                                                        fb_reverse1=bool(getattr(state, 'file_browser_reverse1', False)),
-                                                        fb_view0=getattr(state, 'file_browser_view0', None),
-                                                        fb_view1=getattr(state, 'file_browser_view1', None),
-                                                        fb_path0=str(getattr(state, 'file_browser_path0', '') or ''),
-                                                        fb_path1=str(getattr(state, 'file_browser_path1', '') or ''),
-                                                        fb_side=int(getattr(state, 'file_browser_side', 0)),
-                                                    )
-                                                    try:
-                                                        net.send({
-                                                            "type": getattr(T,'PREFS_SET','prefs_set'),
-                                                            "values": {
-                                                                "fb_show_hidden0": bool(getattr(state,'file_browser_show_hidden0',True)),
-                                                                "fb_show_hidden1": bool(getattr(state,'file_browser_show_hidden1',True)),
-                                                                "fb_sort0": str(getattr(state,'file_browser_sort0','name')),
-                                                                "fb_sort1": str(getattr(state,'file_browser_sort1','name')),
-                                                                "fb_dirs_first0": bool(getattr(state,'file_browser_dirs_first0',False)),
-                                                                "fb_dirs_first1": bool(getattr(state,'file_browser_dirs_first1',False)),
-                                                                "fb_reverse0": bool(getattr(state,'file_browser_reverse0',False)),
-                                                                "fb_reverse1": bool(getattr(state,'file_browser_reverse1',False)),
-                                                                "fb_view0": getattr(state,'file_browser_view0',None),
-                                                                "fb_view1": getattr(state,'file_browser_view1',None),
-                                                            }
-                                                        })
-                                                    except Exception:
-                                                        pass
-                                            except Exception:
-                                                pass
-                                            # close menu and set status
-                                            state.file_browser_menu_mode = False
-                                            try:
-                                                state.status = f"Меню: применено — {lab}"
-                                            except Exception:
-                                                pass
-                                        except Exception:
-                                            state.file_browser_menu_mode = False
-                                    continue
-                            # Otherwise click inside lists (select; open on double-click or fast second click)
-                            if list_top <= my < list_top + list_rows:
-                                row = my - list_top
-                                if side == 0 and items0:
-                                    new_idx = max(0, min(len(items0)-1, start0 + row))
-                                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                        st.index0 = new_idx; st.side = 0
-                                    else:
-                                        state.file_browser_index0 = new_idx; state.file_browser_side = 0
-                                elif side == 1 and items1:
-                                    new_idx = max(0, min(len(items1)-1, start1 + row))
-                                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                        st.index1 = new_idx; st.side = 1
-                                    else:
-                                        state.file_browser_index1 = new_idx; state.file_browser_side = 1
-                                # Determine open by double-click or fast second click
-                                open_now = bool(bstate & getattr(curses, 'BUTTON1_DOUBLE_CLICKED', 0))
-                                try:
-                                    import time as _t
-                                    now = float(_t.time())
-                                    last_ts = float(getattr(state, 'fb_last_click_ts', 0.0))
-                                    last_side = int(getattr(state, 'fb_last_click_side', -1))
-                                    last_row = int(getattr(state, 'fb_last_click_row', -1))
-                                    cur_row = (start0 + row) if side == 0 else (start1 + row)
-                                    if (side == last_side) and (cur_row == last_row) and ((now - last_ts) <= 0.4):
-                                        open_now = True
-                                    state.fb_last_click_ts = now
-                                    state.fb_last_click_side = side
-                                    state.fb_last_click_row = cur_row
-                                except Exception:
-                                    pass
-                                if open_now:
-                                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                        st2, chosen = fb_handle(state.file_browser_state, 'ENTER')
-                                        state.file_browser_state = st2
-                                        if chosen:
-                                            try:
-                                                sp = str(_Path(chosen).expanduser().resolve())
-                                            except Exception:
-                                                sp = str(chosen)
-                                            if sp:
-                                                txt = f"/file {sp}"
-                                                state.input_buffer = txt
-                                                state.input_caret = len(txt)
-                                                state.status = f"Выбран файл: {sp}"
-                                            close_file_browser(state)  # type: ignore[name-defined]
-                                        else:
-                                            try:
-                                                _persist_file_browser_state(state)  # type: ignore[name-defined]
-                                            except Exception:
-                                                pass
-                                    else:
-                                        # Fallback open/choose
-                                        if side == 0:
-                                            idx = max(0, min(len(items0)-1, new_idx)); name, is_dir = items0[idx]; cur = state.file_browser_path0
-                                        else:
-                                            idx = max(0, min(len(items1)-1, new_idx)); name, is_dir = items1[idx]; cur = state.file_browser_path1
-                                        if is_dir:
-                                            nxt = _os.path.join(cur, name) if name != '..' else (_os.path.dirname(cur.rstrip(_os.sep)) or cur)
-                                            if _os.path.isdir(nxt):
-                                                if side == 0:
-                                                    state.file_browser_path0 = nxt; state.file_browser_items0 = _list_dir(nxt, 0); state.file_browser_index0 = 0
-                                                else:
-                                                    state.file_browser_path1 = nxt; state.file_browser_items1 = _list_dir(nxt, 1); state.file_browser_index1 = 0
-                                                state.status = f"Файлы: {nxt}"
-                                        else:
-                                            try:
-                                                sp = str(_Path(_os.path.join(cur, name)).expanduser().resolve())
-                                            except Exception:
-                                                sp = _os.path.join(cur, name)
-                                            txt = f"/file {sp}"
-                                            state.input_buffer = txt; state.input_caret = len(txt)
-                                            state.status = f"Выбран файл: {sp}"
-                                            close_file_browser(state)  # type: ignore[name-defined]
-                                continue
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                # Determine pane by x
-                side = 0 if mx < split_x else 1
-                # Prepare data and compute window starts
-                if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                    st = state.file_browser_state
-                    idx0 = int(getattr(st, 'index0', 0)); idx1 = int(getattr(st, 'index1', 0))
-                    items0 = list(getattr(st, 'items0', []) or [])
-                    items1 = list(getattr(st, 'items1', []) or [])
-                    start0 = fb_window(idx0, len(items0), list_rows)
-                    start1 = fb_window(idx1, len(items1), list_rows)
-                else:
-                    idx0 = int(getattr(state, 'file_browser_index0', 0)); idx1 = int(getattr(state, 'file_browser_index1', 0))
-                    items0 = list(getattr(state, 'file_browser_items0', []) or [])
-                    items1 = list(getattr(state, 'file_browser_items1', []) or [])
-                    start0 = max(0, min(idx0 - list_rows // 2, max(0, len(items0) - list_rows)))
-                    start1 = max(0, min(idx1 - list_rows // 2, max(0, len(items1) - list_rows)))
-                # Wheel support
-                wheel_up, wheel_down = _compute_wheel_masks()
-                if bstate & wheel_up:
-                    delta = 3
-                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                        st.index0 = max(0, st.index0 - delta) if side == 0 else st.index0
-                        st.index1 = max(0, st.index1 - delta) if side == 1 else st.index1
-                    else:
-                        if side == 0 and items0:
-                            state.file_browser_index0 = max(0, state.file_browser_index0 - delta)
-                        if side == 1 and items1:
-                            state.file_browser_index1 = max(0, state.file_browser_index1 - delta)
-                    continue
-                if bstate & wheel_down:
-                    delta = 3
-                    if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                        st.index0 = min(len(items0)-1, st.index0 + delta) if side == 0 and items0 else st.index0
-                        st.index1 = min(len(items1)-1, st.index1 + delta) if side == 1 and items1 else st.index1
-                    else:
-                        if side == 0 and items0:
-                            state.file_browser_index0 = min(len(items0)-1, state.file_browser_index0 + delta)
-                        if side == 1 and items1:
-                            state.file_browser_index1 = min(len(items1)-1, state.file_browser_index1 + delta)
-                    continue
-                # Click inside dropdown menu to select/activate
-                if getattr(state, 'file_browser_menu_mode', False):
-                    # Recompute dropdown rect as in draw
-                    top = int(getattr(state, 'file_browser_menu_top', 0))
-                    if top == 0:
-                        box_w = max(26, min(40, pane_w0 - 2)); x0 = 0
-                        items_cnt = 2
-                    elif top == 2:
-                        box_w = max(26, min(40, pane_w1 - 2)); x0 = split_x + 1
-                        items_cnt = 2
-                    else:
-                        box_w = max(30, min(48, w - 4)); x0 = max(0, (w - box_w)//2)
-                        items_cnt = 6
-                    y0 = 1
-                    inside = (y0 <= my <= y0 + 1 + items_cnt)
-                    inside = inside and (x0 <= mx < x0 + box_w)
-                    if inside:
-                        row = my - (y0 + 1)
-                        if 0 <= row < items_cnt:
-                            state.file_browser_menu_index = row
-                            # Apply immediately on single click
-                            try:
-                                idx = row
-                                # Build items like draw and execute selection (same as Enter logic)
-                                if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                    st = state.file_browser_state
-                                    side = 0 if top == 0 else (1 if top == 2 else int(getattr(st, 'side', 0)))
-                                    sh = getattr(st, 'show_hidden0' if side == 0 else 'show_hidden1', True)
-                                else:
-                                    st = None; side = 0; sh = True
-                                if top in (0,2):
-                                    items = [
-                                        f"Показать скрытые файлы: {'Выкл' if sh else 'Вкл'}",
-                                        "Обновить",
-                                    ]
-                                else:
-                                    items = [
-                                        f"Сортировать: Дата создания",
-                                        f"Сортировать: Дата редактирования",
-                                        f"Сортировать: Дата добавления",
-                                        "Вид: по папкам",
-                                        "Вид: по файлам",
-                                        "Вид: все",
-                                    ]
-                                lab = items[max(0, min(len(items)-1, idx))]
-                                if top in (0,2):
-                                    if lab.startswith('Показать скрытые файлы'):
-                                        if st is not None:
-                                            if side == 0:
-                                                st.show_hidden0 = not bool(st.show_hidden0)
-                                                st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0, view=st.view0)
-                                            else:
-                                                st.show_hidden1 = not bool(st.show_hidden1)
-                                                st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1, view=st.view1)
-                                        else:
-                                            # Fallback state
-                                            if side == 0:
-                                                state.file_browser_show_hidden0 = not bool(getattr(state, 'file_browser_show_hidden0', True))
-                                                base = state.file_browser_path0 or str(_Path('.').resolve())
-                                                state.file_browser_items0 = _list_dir(base, 0)
-                                            else:
-                                                state.file_browser_show_hidden1 = not bool(getattr(state, 'file_browser_show_hidden1', True))
-                                                base = state.file_browser_path1 or str(_Path('.').resolve())
-                                                state.file_browser_items1 = _list_dir(base, 1)
-                                    elif lab == 'Обновить':
-                                        if st is not None:
-                                            if side == 0:
-                                                st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0, view=st.view0)
-                                            else:
-                                                st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1, view=st.view1)
-                                        else:
-                                            pass
-                                else:
-                                    if st is not None:
-                                        if lab.endswith('Дата создания'):
-                                            st.sort0, st.reverse0 = 'created', True
-                                            st.sort1, st.reverse1 = 'created', True
-                                        elif lab.endswith('Дата редактирования'):
-                                            st.sort0, st.reverse0 = 'modified', True
-                                            st.sort1, st.reverse1 = 'modified', True
-                                        elif lab.endswith('Дата добавления'):
-                                            st.sort0, st.reverse0 = 'added', True
-                                            st.sort1, st.reverse1 = 'added', True
-                                        elif lab.endswith('по папкам'):
-                                            st.view0 = 'dirs'; st.view1 = 'dirs'
-                                        elif lab.endswith('по файлам'):
-                                            st.view0 = 'files'; st.view1 = 'files'
-                                        elif lab.endswith('все'):
-                                            st.view0 = None; st.view1 = None
-                                        # Relist both panes
-                                        st.items0 = fb_list(st.path0, show_hidden=st.show_hidden0, sort=st.sort0, dirs_first=st.dirs_first0, reverse=st.reverse0, view=st.view0)
-                                        st.items1 = fb_list(st.path1, show_hidden=st.show_hidden1, sort=st.sort1, dirs_first=st.dirs_first1, reverse=st.reverse1, view=st.view1)
-                                        st.index0 = min(st.index0, len(st.items0)-1) if st.items0 else 0
-                                        st.index1 = min(st.index1, len(st.items1)-1) if st.items1 else 0
-                                # Persist prefs after any change
-                                if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                                    _save_fb_prefs(state.file_browser_state)
-                                else:
-                                    _save_fb_prefs_values(
-                                        fb_show_hidden0=bool(getattr(state, 'file_browser_show_hidden0', True)),
-                                        fb_show_hidden1=bool(getattr(state, 'file_browser_show_hidden1', True)),
-                                        fb_sort0=str(getattr(state, 'file_browser_sort0', 'name')),
-                                        fb_sort1=str(getattr(state, 'file_browser_sort1', 'name')),
-                                        fb_dirs_first0=bool(getattr(state, 'file_browser_dirs_first0', False)),
-                                        fb_dirs_first1=bool(getattr(state, 'file_browser_dirs_first1', False)),
-                                        fb_reverse0=bool(getattr(state, 'file_browser_reverse0', False)),
-                                        fb_reverse1=bool(getattr(state, 'file_browser_reverse1', False)),
-                                        fb_view0=getattr(state, 'file_browser_view0', None),
-                                        fb_view1=getattr(state, 'file_browser_view1', None),
-                                        fb_path0=str(getattr(state, 'file_browser_path0', '') or ''),
-                                        fb_path1=str(getattr(state, 'file_browser_path1', '') or ''),
-                                        fb_side=int(getattr(state, 'file_browser_side', 0)),
-                                    )
-                            except Exception:
-                                pass
-                            state.file_browser_menu_mode = False
-                        continue
-                # Click inside lists (only when no dropdown menu is open or click outside menu)
-                if (not getattr(state, 'file_browser_menu_mode', False)) and (list_top <= my < list_top + list_rows):
-                    row = my - list_top
-                    if side == 0 and items0:
-                        new_idx = max(0, min(len(items0)-1, start0 + row))
-                        if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                            st.index0 = new_idx; st.side = 0
-                        else:
-                            state.file_browser_index0 = new_idx; state.file_browser_side = 0
-                    elif side == 1 and items1:
-                        new_idx = max(0, min(len(items1)-1, start1 + row))
-                        if (not FILE_BROWSER_FALLBACK) and (state.file_browser_state is not None):
-                            st.index1 = new_idx; st.side = 1
-                        else:
-                            state.file_browser_index1 = new_idx; state.file_browser_side = 1
-                    # Double click = Enter
-                    if bstate & getattr(curses, 'BUTTON1_DOUBLE_CLICKED', 0):
-                        # Reuse Enter handler
-                        ch2 = '\n'
-                        # Fall through to Enter logic next frame
-                    continue
 
         # Search action modal handling
         if state.search_action_mode:
@@ -13769,6 +12385,19 @@ def main(stdscr):
                 # minimal parse
                 try:
                     body = seq[1:]
+                    fn = normalize_function_key_escape(body)
+                    if fn == 'F5':
+                        _dbg("[key F5 esc] group create modal")
+                        _set_group_create_defaults(state)
+                        continue
+                    if fn == 'F6':
+                        _dbg("[key F6 esc] board create modal")
+                        _set_board_create_defaults(state)
+                        continue
+                    if fn == 'F7':
+                        _dbg("[key F7 esc] file browser")
+                        _hotkey_file_browser(state, start_file_browser, close_file_browser)  # type: ignore[arg-type]
+                        continue
                     # Plain arrows (ESC [ D/C/A/B) — map to caret moves when input is active
                     if body in ('D','C','A','B'):
                         # Respect overlays: only edit when no blocking modal
@@ -14764,35 +13393,7 @@ def main(stdscr):
                         pass
                     # Локальная первичная проверка контакт-листа
                     try:
-                        def _local_rel_for(qs: str):
-                            rid = None
-                            # По точному ID
-                            if qs and not qs.startswith('@'):
-                                known = set(state.friends.keys()) | set(state.roster_friends.keys()) | set(state.pending_requests) | set(state.pending_out) | set(state.blocked)
-                                if qs in known:
-                                    rid = qs
-                            # По @логину из локального кэша профилей
-                            if (rid is None) and qs.startswith('@'):
-                                for pid, prof in (state.profiles or {}).items():
-                                    try:
-                                        if (prof or {}).get('handle') == qs:
-                                            rid = pid
-                                            break
-                                    except Exception:
-                                        pass
-                            if not rid:
-                                return None
-                            if rid in state.blocked:
-                                return rid, 'blocked'
-                            if (rid in state.friends) or (rid in state.roster_friends):
-                                return rid, 'friend'
-                            if rid in state.pending_requests:
-                                return rid, 'incoming'
-                            if rid in state.pending_out:
-                                return rid, 'outgoing'
-                            return rid, 'known'
-
-                        local = _local_rel_for(q)
+                        local = _local_relation_for_query(state, q)
                         if local:
                             rid, rel = local
                             mapping = {
@@ -15141,52 +13742,6 @@ def main(stdscr):
                 to = current_selected_id(state)
                 text = state.input_buffer.strip()
                 if text:
-                    def _debug_line(msg: str):
-                        try:
-                            state.debug_lines.append(msg)
-                            if len(state.debug_lines) > 300:
-                                del state.debug_lines[:len(state.debug_lines) - 300]
-                        except Exception:
-                            pass
-                    def _run_selftest(mode: str):
-                        if mode not in ('update', 'file', 'reg'):
-                            state.status = "Используйте: /selftest update|file|reg"
-                            return
-                        state.status = f"Selftest {mode}..."
-                        _debug_line(f"[selftest] start {mode}")
-                        try:
-                            if mode == 'update':
-                                base = _get_update_base_url()
-                                if not base:
-                                    _debug_line("[selftest:update] UPDATE_URL не задан")
-                                else:
-                                    mani = _load_manifest(base, timeout=4.0)
-                                    if mani:
-                                        entries = _safe_manifest_entries(mani)
-                                        _debug_line(f"[selftest:update] manifest ok version={mani.get('version')} files={len(entries)}")
-                                    else:
-                                        _debug_line("[selftest:update] не удалось загрузить manifest")
-                            elif mode == 'file':
-                                try:
-                                    tmp_dir = FILES_DIR / "selftest"
-                                    tmp_dir.mkdir(parents=True, exist_ok=True)
-                                    tmp_path = tmp_dir / "probe.txt"
-                                    tmp_path.write_text("selftest-file-payload", encoding='utf-8')
-                                    _debug_line(f"[selftest:file] подготовлен файл {tmp_path} size={tmp_path.stat().st_size}")
-                                except Exception as e:
-                                    _debug_line(f"[selftest:file] ошибка подготовки файла: {e}")
-                            elif mode == 'reg':
-                                try:
-                                    rid = "selftest-" + str(int(time.time()))
-                                    payload = {"type": "register", "id": rid, "password": "testpw"}
-                                    state.selftest_reg = True
-                                    state.selftest_reg_pw = "testpw"
-                                    net.send(payload)
-                                    _debug_line(f"[selftest:reg] отправлен запрос: {payload}")
-                                except Exception as e:
-                                    _debug_line(f"[selftest:reg] ошибка отправки: {e}")
-                        except Exception as e:
-                            _debug_line(f"[selftest] ошибка: {e}")
                     # Slash-commands
                     if text.startswith('/'):
                         cmd = text.split()[0]
@@ -15265,7 +13820,7 @@ def main(stdscr):
                         elif cmd in ('/update', '/filetest', '/regtest'):
                             # Алиасы для selftest
                             mode = 'update' if cmd == '/update' else ('file' if cmd == '/filetest' else 'reg')
-                            _run_selftest(mode)
+                            _run_selftest_command(state, net, mode)
                             state.input_buffer = ""
                             state.input_caret = 0
                             state.history_scroll = 0
@@ -15276,7 +13831,7 @@ def main(stdscr):
                             if mode not in ('update', 'file', 'reg'):
                                 state.status = "Используйте: /selftest update|file|reg"
                             else:
-                                _run_selftest(mode)
+                                _run_selftest_command(state, net, mode)
                             state.input_buffer = ""
                             state.input_caret = 0
                             state.history_scroll = 0
@@ -15840,14 +14395,14 @@ def main(stdscr):
             # Normalize function key escape sequences for terminals that don't map to curses.KEY_Fx
             try:
                 if isinstance(ch, str):
-                    # Common xterm sequences for F-keys
-                    if ch in ('\x1b[18~',):  # F7
+                    fn = normalize_function_key_escape(ch)
+                    if fn == 'F7':
                         _dbg("[key F7 seq] normalize to KEY_F7"); ch = curses.KEY_F7
-                    elif ch in ('\x1b[15~',):  # F5
+                    elif fn == 'F5':
                         _dbg("[key F5 seq] normalize to KEY_F5"); ch = curses.KEY_F5
-                    elif ch in ('\x1b[17~',):  # F6
+                    elif fn == 'F6':
                         _dbg("[key F6 seq] normalize to KEY_F6"); ch = curses.KEY_F6
-                    elif ch in ('\x1b[24~',):  # F12
+                    elif fn == 'F12':
                         try:
                             ch = curses.KEY_F12
                         except Exception:
@@ -16808,52 +15363,57 @@ if __name__ == '__main__':
     #   ./client.py INFO --stderr    -> LOG_LEVEL=INFO + also log to stderr
     #   ./client.py - DEBUG --log-file=/tmp/client-debug.log --json
     #   ./client.py --no-mouse --vi
+    def _apply_cli_log_level(args: List[str]) -> None:
+        for arg in args:
+            value = (arg or '').strip()
+            if value in ('-', '--'):
+                continue
+            upper = value.upper()
+            if upper in ('DEBUG', 'INFO', 'WARNING', 'ERROR'):
+                os.environ['LOG_LEVEL'] = upper
+
+    def _apply_cli_log_file(args: List[str]) -> None:
+        for i, arg in enumerate(args):
+            if arg.startswith('--log-file='):
+                os.environ['CLIENT_LOG_FILE'] = arg.split('=', 1)[1]
+            elif arg in ('-l', '--log-file') and i + 1 < len(args):
+                os.environ['CLIENT_LOG_FILE'] = args[i + 1]
+
+    def _apply_cli_switches(args: List[str]) -> None:
+        mapping = {
+            '--stderr': ('CLIENT_LOG_STDERR', '1'),
+            '--stderr-tui': ('CLIENT_STDERR_TUI', '1'),
+            '--json': ('LOG_JSON', '1'),
+            '--no-mouse': ('CLIENT_MOUSE', '0'),
+            '--vi': ('CLIENT_VI_KEYS', '1'),
+        }
+        for flag, env_kv in mapping.items():
+            if flag in args:
+                key, value = env_kv
+                os.environ[key] = value
+
+    def _print_cli_help() -> None:
+        print('Usage: ./client.py [LEVEL] [options]\n'
+              '  LEVEL: DEBUG|INFO|WARNING|ERROR (sets LOG_LEVEL)\n'
+              'Options:\n'
+              '  --log-file=PATH | -l PATH   Write logs to PATH (rotating)\n'
+              '  --stderr                    Also log to stderr before TUI (suppressed in TUI)\n'
+              '  --stderr-tui                Force log to stderr during TUI (may break UI)\n'
+              '  --json                      JSON-formatted logs\n'
+              '  --no-mouse                  Disable in-app mouse handling\n'
+              '  --vi                        Enable vi-like keys in list (k/j)\n'
+              'Examples:\n'
+              '  ./client.py DEBUG --stderr\n'
+              '  ./client.py - DEBUG --log-file=/tmp/client.log --json\n')
+
     def _apply_cli_args(argv: List[str]) -> None:
         try:
             args = list(argv[1:])
-            # Simple levels: DEBUG/INFO/WARNING/ERROR
-            for a in args:
-                av = (a or '').strip()
-                if av in ('-', '--'):
-                    continue
-                u = av.upper()
-                if u in ('DEBUG', 'INFO', 'WARNING', 'ERROR'):
-                    os.environ['LOG_LEVEL'] = u
-            # --log-file=<path> or -l <path>
-            for i, a in enumerate(args):
-                if a.startswith('--log-file='):
-                    os.environ['CLIENT_LOG_FILE'] = a.split('=', 1)[1]
-                elif a in ('-l', '--log-file') and i + 1 < len(args):
-                    os.environ['CLIENT_LOG_FILE'] = args[i + 1]
-            # --stderr -> also log to stderr (startup only); suppressed inside TUI to avoid breaking UI
-            # Use --stderr-tui to force logs to stderr during TUI (not recommended)
-            if '--stderr' in args:
-                os.environ['CLIENT_LOG_STDERR'] = '1'
-            if '--stderr-tui' in args:
-                os.environ['CLIENT_STDERR_TUI'] = '1'
-            # --json -> JSON logs instead of plain text
-            if '--json' in args:
-                os.environ['LOG_JSON'] = '1'
-            # --no-mouse -> disable in-app mouse (use terminal selection)
-            if '--no-mouse' in args:
-                os.environ['CLIENT_MOUSE'] = '0'
-            # --vi -> enable vi-like keys (k/j in list)
-            if '--vi' in args:
-                os.environ['CLIENT_VI_KEYS'] = '1'
-            # Help
+            _apply_cli_log_level(args)
+            _apply_cli_log_file(args)
+            _apply_cli_switches(args)
             if '--help' in args or '-h' in args:
-                print('Usage: ./client.py [LEVEL] [options]\n' \
-                      '  LEVEL: DEBUG|INFO|WARNING|ERROR (sets LOG_LEVEL)\n' \
-                      'Options:\n' \
-                      '  --log-file=PATH | -l PATH   Write logs to PATH (rotating)\n' \
-                      '  --stderr                    Also log to stderr before TUI (suppressed in TUI)\n' \
-                      '  --stderr-tui                Force log to stderr during TUI (may break UI)\n' \
-                      '  --json                      JSON-formatted logs\n' \
-                      '  --no-mouse                  Disable in-app mouse handling\n' \
-                      '  --vi                        Enable vi-like keys in list (k/j)\n' \
-                      'Examples:\n' \
-                      '  ./client.py DEBUG --stderr\n' \
-                      '  ./client.py - DEBUG --log-file=/tmp/client.log --json\n')
+                _print_cli_help()
                 sys.exit(0)
         except SystemExit:
             raise
@@ -16913,42 +15473,11 @@ if __name__ == '__main__':
 
     def start_file_browser(state: ClientState) -> None:
         try:
-            import os as _os
-            from pathlib import Path as _Path
-
-            # Close conflicting overlays
-            state.search_action_mode = False
-            state.action_menu_mode = False
-            state.profile_mode = False
-            state.profile_view_mode = False
-            state.modal_message = None
-
-            state.file_browser_view_mode = False
-            state.file_browser_settings_mode = False
-            state.file_browser_menu_mode = False
-
-            # Proactively fetch server-side prefs when authed
-            try:
-                if getattr(state, 'authed', False):
-                    net.send({"type": getattr(T, 'PREFS_GET', 'prefs_get')})
-            except Exception:
-                pass
-
+            _fm_reset_overlays(state)
+            _fm_request_remote_prefs(state, net)
             prefs = _get_fb_prefs()
-            start = _fm_norm_path('.')
-            try:
-                p0 = prefs.get('fb_path0')
-                if p0 and _os.path.isdir(str(p0)):
-                    start = _fm_norm_path(str(p0))
-                else:
-                    home = _fm_norm_path('~')
-                    if _os.path.isdir(home):
-                        start = home
-            except Exception:
-                pass
-
             fm = FileManagerState(
-                path=start,
+                path=_fm_initial_path(prefs),
                 show_hidden=bool(prefs.get('fb_show_hidden0', False)),
                 sort=str(prefs.get('fb_sort0', 'name')),
                 dirs_first=bool(prefs.get('fb_dirs_first0', True)),
@@ -16961,16 +15490,7 @@ if __name__ == '__main__':
             state.file_browser_side = 0
             state.file_browser_state = fm
 
-            # Mirror into legacy fields for compatibility with older helpers
-            try:
-                state.file_browser_path0 = str(fm.path or '')
-                state.file_browser_show_hidden0 = bool(fm.show_hidden)
-                state.file_browser_sort0 = str(fm.sort or 'name')
-                state.file_browser_dirs_first0 = bool(fm.dirs_first)
-                state.file_browser_reverse0 = bool(fm.reverse)
-                state.file_browser_view0 = fm.view
-            except Exception:
-                pass
+            _fm_sync_legacy_fields(state, fm)
             state.status = ""
         except Exception:
             close_file_browser(state)  # type: ignore[name-defined]
@@ -16994,38 +15514,50 @@ if __name__ == '__main__':
         except Exception:
             pass
 
+    def _restore_terminal_curses_state() -> None:
+        try:
+            curses.echo()
+            curses.nocbreak()
+        except Exception:
+            pass
+
+    def _disable_terminal_mouse_modes() -> None:
+        try:
+            _term_write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?1007l\x1b[?1004l", tmux_passthrough=True)
+        except Exception:
+            pass
+
+    def _restore_tmux_mouse_after_tui() -> None:
+        if not os.environ.get('TMUX') or not bool(globals().get('__TMUX_MOUSE_AUTO_ENABLED__')):
+            return
+        prev = globals().get('__TMUX_MOUSE_PREV__')
+        if prev is None:
+            return
+        prev_norm = str(prev).strip().lower()
+        if prev_norm not in ('off', '0', 'false', 'no', ''):
+            return
+        try:
+            subprocess.run(
+                ['tmux', 'set', '-g', 'mouse', 'off'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=0.25,
+                check=False,
+            )
+            globals()['__TMUX_MOUSE_AUTO_ENABLED__'] = False
+        except Exception:
+            pass
+
+    def _leave_alt_screen() -> None:
+        sys.stdout.write("\x1b[?25h\x1b[0m\x1b[?1049l\r\n")
+        sys.stdout.flush()
+
     def _exit_alt_screen():
         try:
-            # Best-effort terminal restore: show cursor, reset attrs, leave alt screen, move to new line
-            try:
-                curses.echo()
-                curses.nocbreak()
-            except Exception:
-                pass
-            try:
-                # Disable mouse/focus reporting so shell won't receive SGR sequences after exit
-                _term_write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?1007l\x1b[?1004l", tmux_passthrough=True)
-            except Exception:
-                pass
-            try:
-                # If we auto-enabled tmux mouse for this session, restore it when we know it was previously off.
-                if os.environ.get('TMUX') and bool(globals().get('__TMUX_MOUSE_AUTO_ENABLED__')):
-                    prev = globals().get('__TMUX_MOUSE_PREV__')
-                    if prev is not None:
-                        prev_norm = str(prev).strip().lower()
-                        if prev_norm in ('off', '0', 'false', 'no', ''):
-                            subprocess.run(
-                                ['tmux', 'set', '-g', 'mouse', 'off'],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                timeout=0.25,
-                                check=False,
-                            )
-                            globals()['__TMUX_MOUSE_AUTO_ENABLED__'] = False
-            except Exception:
-                pass
-            sys.stdout.write("\x1b[?25h\x1b[0m\x1b[?1049l\r\n")
-            sys.stdout.flush()
+            _restore_terminal_curses_state()
+            _disable_terminal_mouse_modes()
+            _restore_tmux_mouse_after_tui()
+            _leave_alt_screen()
         except Exception:
             pass
 

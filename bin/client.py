@@ -837,7 +837,7 @@ except Exception:
     def get_file_system_suggestions(token: str, cwd=None, limit: int = 20):
         return []
 
-CLIENT_VERSION = "0.4.2154"
+CLIENT_VERSION = "0.4.2156"
 _VER_PART_RE = re.compile(r"\d+")
 
 
@@ -3183,6 +3183,37 @@ def _fm_sync_legacy_fields(state: "ClientState", fm: FileManagerState) -> None:
         pass
 
 
+def _init_file_browser_modal_state(state: "ClientState") -> FileManagerState:
+    _fm_reset_overlays(state)
+    net_client = getattr(state, 'net_client', None)
+    if net_client is not None:
+        try:
+            _fm_request_remote_prefs(state, net_client)
+        except Exception:
+            logging.getLogger('client').warning(
+                "File browser prefs refresh failed during open",
+                exc_info=True,
+            )
+    prefs = _get_fb_prefs()
+    fm = FileManagerState(
+        path=_fm_initial_path(prefs),
+        show_hidden=bool(prefs.get('fb_show_hidden0', False)),
+        sort=str(prefs.get('fb_sort0', 'name')),
+        dirs_first=bool(prefs.get('fb_dirs_first0', True)),
+        reverse=bool(prefs.get('fb_reverse0', False)),
+        view=prefs.get('fb_view0', None),
+    )
+    _fm_relist(fm)
+
+    state.file_browser_mode = True
+    state.file_browser_side = 0
+    state.file_browser_state = fm
+
+    _fm_sync_legacy_fields(state, fm)
+    state.status = ""
+    return fm
+
+
 def _mask_secret(value: object) -> str:
     return '*' * len(str(value or ''))
 
@@ -3589,6 +3620,7 @@ class ClientState:
     login_retry_count: int = 0
     # Версия сервера
     server_version: Optional[str] = None
+    net_client: object = None
     # Client integrity vs server
     last_local_sha: Optional[str] = None
     last_server_sha: Optional[str] = None
@@ -8032,6 +8064,7 @@ def main(stdscr):
     incoming: "queue.Queue[dict]" = queue.Queue()
     net = NetworkClient(host, port, incoming, use_tls=use_tls)
     net.start()
+    state.net_client = net
 
     def trigger_hotkey(name: str) -> None:
         nonlocal state
@@ -15509,25 +15542,7 @@ if __name__ == '__main__':
 
     def start_file_browser(state: ClientState) -> None:
         try:
-            _fm_reset_overlays(state)
-            _fm_request_remote_prefs(state, net)
-            prefs = _get_fb_prefs()
-            fm = FileManagerState(
-                path=_fm_initial_path(prefs),
-                show_hidden=bool(prefs.get('fb_show_hidden0', False)),
-                sort=str(prefs.get('fb_sort0', 'name')),
-                dirs_first=bool(prefs.get('fb_dirs_first0', True)),
-                reverse=bool(prefs.get('fb_reverse0', False)),
-                view=prefs.get('fb_view0', None),
-            )
-            _fm_relist(fm)
-
-            state.file_browser_mode = True
-            state.file_browser_side = 0
-            state.file_browser_state = fm
-
-            _fm_sync_legacy_fields(state, fm)
-            state.status = ""
+            _init_file_browser_modal_state(state)
         except Exception:
             logging.getLogger('client').exception("Failed to initialize file browser")
             close_file_browser(state)  # type: ignore[name-defined]

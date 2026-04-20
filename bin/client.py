@@ -3155,6 +3155,8 @@ def _fm_reset_overlays(state: "ClientState") -> None:
     state.action_menu_mode = False
     state.profile_mode = False
     state.profile_view_mode = False
+    state.help_mode = False
+    state.members_view_mode = False
     state.modal_message = None
     state.file_browser_view_mode = False
     state.file_browser_settings_mode = False
@@ -3179,6 +3181,14 @@ def _fm_sync_legacy_fields(state: "ClientState", fm: FileManagerState) -> None:
         state.file_browser_view0 = fm.view
     except Exception:
         pass
+
+
+def _mask_secret(value: object) -> str:
+    return '*' * len(str(value or ''))
+
+
+def _auth_field_row(prefix: str, label: str, value: str, width: int) -> str:
+    return pad_to_width(f"{prefix}{label}{value}", width)
 
 
 def _draw_file_manager_modal(stdscr, state: "ClientState", *, top_line: int = 1) -> None:
@@ -4701,6 +4711,30 @@ def _touch_contact_rows(state: ClientState) -> None:
         pass
 
 
+def _set_contact_presence(state: ClientState, cid: object, online: bool, *, touch: bool = True) -> bool:
+    """Update cached presence and invalidate left-pane rows when it changes."""
+    try:
+        clean_id = str(cid or "").strip()
+    except Exception:
+        clean_id = ""
+    if not clean_id:
+        return False
+    try:
+        statuses = getattr(state, "statuses", None)
+        if not isinstance(statuses, dict):
+            statuses = {}
+            state.statuses = statuses
+        new_value = bool(online)
+        previous = statuses.get(clean_id, None)
+        statuses[clean_id] = new_value
+        changed = previous is None or bool(previous) != new_value
+    except Exception:
+        return False
+    if changed and touch:
+        _touch_contact_rows(state)
+    return changed
+
+
 def _cached_contact_rows(state: ClientState) -> Optional[List[str]]:
     try:
         rev = int(getattr(state, '_contact_rows_rev', 0))
@@ -5570,6 +5604,8 @@ def _hotkey_file_browser(state: ClientState, start_file_browser, close_file_brow
     try:
         _log_action("file browser open")
         start_file_browser(state)  # type: ignore[misc]
+        if not bool(getattr(state, 'file_browser_mode', False)):
+            raise RuntimeError("file browser did not enter modal mode")
     except Exception:
         logging.getLogger('client').exception("Failed to open file browser")
         close_file_browser(state)  # type: ignore[misc]
@@ -5673,9 +5709,6 @@ def draw_ui(stdscr, state: ClientState):
         box_w = min(64, w - 4)
         x = max(2, (w - box_w) // 2)
 
-        def mask(s: str) -> str:
-            return '*' * len(s)
-
         # Draw form frame
         box_h = 8
         # top border
@@ -5692,8 +5725,8 @@ def draw_ui(stdscr, state: ClientState):
             lbl1 = "Пароль: "
             prefix0 = "> " if state.login_field == 0 else "  "
             prefix1 = "> " if state.login_field == 1 else "  "
-            line0 = (prefix0 + lbl0 + state.id_input)
-            line1 = (prefix1 + lbl1 + mask(state.pw1))
+            line0 = _auth_field_row(prefix0, lbl0, state.id_input, box_w)
+            line1 = _auth_field_row(prefix1, lbl1, _mask_secret(state.pw1), box_w)
             stdscr.addnstr(mid_y, x, line0[: box_w], box_w)
             stdscr.addnstr(mid_y + 2, x, line1[: box_w], box_w)
             hint = "Enter — далее / войти | ESC — выход"
@@ -5702,15 +5735,15 @@ def draw_ui(stdscr, state: ClientState):
             lbl2 = "Подтвердите: "
             prefix0 = "> " if state.login_field == 0 else "  "
             prefix1 = "> " if state.login_field == 1 else "  "
-            line0 = (prefix0 + lbl1 + mask(state.pw1))
-            line1 = (prefix1 + lbl2 + mask(state.pw2))
+            line0 = _auth_field_row(prefix0, lbl1, _mask_secret(state.pw1), box_w)
+            line1 = _auth_field_row(prefix1, lbl2, _mask_secret(state.pw2), box_w)
             stdscr.addnstr(mid_y, x, line0[: box_w], box_w)
             stdscr.addnstr(mid_y + 2, x, line1[: box_w], box_w)
             hint = "Enter — далее / зарегистрироваться | ESC — выход"
 
-        stdscr.addnstr(mid_y + 5, x, hint[: box_w], box_w, CP.get('warn', curses.A_BOLD))
+        stdscr.addnstr(mid_y + 5, x, pad_to_width(hint, box_w), box_w, CP.get('warn', curses.A_BOLD))
         if state.login_msg:
-            stdscr.addnstr(mid_y + 7, x, state.login_msg[: box_w], box_w, CP.get('error', curses.A_BOLD))
+            stdscr.addnstr(mid_y + 7, x, pad_to_width(state.login_msg, box_w), box_w, CP.get('error', curses.A_BOLD))
         # Caret on the active input field (hardware cursor via controller)
         try:
             # Clamp caret within content box and avoid last column to prevent wrap
@@ -8168,9 +8201,10 @@ def main(stdscr):
                 state.contacts = list(msg.get('contacts', []))
                 state.contacts.sort()
                 # track statuses for known online contacts
+                presence_changed = False
                 for cid in state.contacts:
                     if cid:
-                        state.statuses[cid] = True
+                        presence_changed = _set_contact_presence(state, cid, True, touch=False) or presence_changed
                 # Capture server version if provided by server
                 try:
                     sv = msg.get('server_version')
@@ -8199,6 +8233,8 @@ def main(stdscr):
                     if sv:
                         state.server_version = sv
                 clamp_selection(state)
+                if presence_changed:
+                    _touch_contact_rows(state)
             elif mtype == 'net_status':
                 st = msg.get('status')
                 try:
@@ -8461,8 +8497,8 @@ def main(stdscr):
                         net.send({"type": "profile_get", "id": cid})
                     except Exception:
                         pass
-                if cid:
-                    state.statuses[cid] = True
+                if _set_contact_presence(state, cid, True, touch=False):
+                    _touch_contact_rows(state)
             elif mtype == T.CONTACT_LEFT:
                 cid = msg.get('id')
                 if cid in state.contacts:
@@ -8471,8 +8507,8 @@ def main(stdscr):
                     state.contacts.remove(cid)
                     clamp_selection(state)
                     logging.getLogger('client').info("Contact left: %s", cid)
-                if cid:
-                    state.statuses[cid] = False
+                if _set_contact_presence(state, cid, False, touch=False):
+                    _touch_contact_rows(state)
             elif mtype == T.CONTACTS:
                 # Snapshot reconciliation
                 contacts = list(msg.get('contacts', []))
@@ -8481,8 +8517,9 @@ def main(stdscr):
                 contacts.sort()
                 state.contacts = contacts
                 # Update statuses for online contacts
+                presence_changed = False
                 for cid in contacts:
-                    state.statuses[cid] = True
+                    presence_changed = _set_contact_presence(state, cid, True, touch=False) or presence_changed
                 # keep selection within bounds
                 clamp_selection(state)
                 logging.getLogger('client').debug("Contacts snapshot applied: %d", len(state.contacts))
@@ -8496,11 +8533,13 @@ def main(stdscr):
                 # Update statuses map using snapshot
                 online_set = set(state.contacts)
                 for cid in online_set:
-                    state.statuses[cid] = True
+                    presence_changed = _set_contact_presence(state, cid, True, touch=False) or presence_changed
                 # Mark previously known as offline if absent
                 for known in list(state.statuses.keys()):
                     if known not in online_set:
-                        state.statuses[known] = False
+                        presence_changed = _set_contact_presence(state, known, False, touch=False) or presence_changed
+                if presence_changed:
+                    _touch_contact_rows(state)
             elif mtype == 'roster_full':
                 # Full server-driven roster with presence and unread counts
                 try:
@@ -8683,14 +8722,14 @@ def main(stdscr):
                     pid = str(msg.get('id'))
                     online = bool(msg.get('online'))
                     if pid:
-                        state.statuses[pid] = online
+                        changed = _set_contact_presence(state, pid, online, touch=False)
                         touched = False
                         if pid in state.roster_friends:
                             state.roster_friends[pid]['online'] = online
                             touched = True
                         elif (not state.roster_friends) and (pid in getattr(state, 'friends', {})):
                             touched = True
-                        if touched:
+                        if changed or touched:
                             _touch_contact_rows(state)
                 except Exception:
                     pass
@@ -14412,10 +14451,7 @@ def main(stdscr):
             if ch == curses.KEY_F7:
                 # Open two-pane file browser modal (isolated initializer)
                 _dbg("[key F7] file browser")
-                try:
-                    start_file_browser(state)  # type: ignore[name-defined]
-                except Exception:
-                    close_file_browser(state)  # type: ignore[name-defined]
+                _hotkey_file_browser(state, start_file_browser, close_file_browser)  # type: ignore[arg-type]
                 continue
             # F12 — toggle debug overlay
             try:
@@ -15493,7 +15529,9 @@ if __name__ == '__main__':
             _fm_sync_legacy_fields(state, fm)
             state.status = ""
         except Exception:
+            logging.getLogger('client').exception("Failed to initialize file browser")
             close_file_browser(state)  # type: ignore[name-defined]
+            raise
     def _preflight_diagnostics():
         try:
             pyver = sys.version.replace('\n', ' ')

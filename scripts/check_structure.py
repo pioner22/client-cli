@@ -18,6 +18,7 @@ EXPECTED_MODULES = {
     "contacts.py",
     "cursor.py",
     "formatting.py",
+    "group_roles.py",
     "error_codes.py",
     "file_browser.py",
     "file_contracts.py",

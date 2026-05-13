@@ -837,7 +837,7 @@ except Exception:
     def get_file_system_suggestions(token: str, cwd=None, limit: int = 20):
         return []
 
-CLIENT_VERSION = "0.4.2156"
+CLIENT_VERSION = "0.4.2175"
 _VER_PART_RE = re.compile(r"\d+")
 
 
@@ -2421,6 +2421,14 @@ def _drop_peer_history_state(state: 'ClientState', peer: str) -> None:
             save_history_index(state.history_last_ids)
     except Exception:
         pass
+    try:
+        state.history_before_exhausted.pop(peer, None)
+    except Exception:
+        pass
+    try:
+        state.history_fetching.discard(peer)
+    except Exception:
+        pass
 
 
 def _remove_peer_user_history_file(peer: str) -> None:
@@ -3827,6 +3835,10 @@ class ClientState:
     authz_menu_snoozed: Set[str] = field(default_factory=set)
     # History probes: peers for which we sent a server-side history check after re-auth
     history_probe_peers: Set[str] = field(default_factory=set)
+    # In-flight history requests by channel/peer
+    history_fetching: Set[str] = field(default_factory=set)
+    # Oldest loaded before_id that already returned an empty page
+    history_before_exhausted: Dict[str, int] = field(default_factory=dict)
     # Outgoing authorization requests that should show persistent overlay in the chat
     authz_out_pending: Set[str] = field(default_factory=set)
     # Live search (F3) status
@@ -3994,6 +4006,19 @@ def _clamp_history_scroll(state: object) -> None:
         state._hist_draw_state = None
     except Exception:
         pass
+
+
+def _history_scroll_at_top(state: object) -> bool:
+    try:
+        total = int(getattr(state, 'last_history_lines_count', 0))
+        hist_h = int(getattr(state, 'last_hist_h', 0))
+        max_scroll = max(0, total - max(1, hist_h))
+        hs = int(getattr(state, 'history_scroll', 0))
+    except Exception:
+        return False
+    if max_scroll <= 0:
+        return True
+    return hs >= max_scroll
 
 
 def _is_read_receipt_target(state: object, peer: str) -> bool:
@@ -4484,6 +4509,183 @@ def _history_payload_for_channel(state, chan: str) -> dict:
     if room_like:
         return {"type": "history", "room": chan, "since_id": since}
     return {"type": "history", "peer": chan, "since_id": since}
+
+
+def _oldest_loaded_history_id(messages: object) -> int:
+    oldest = 0
+    if not isinstance(messages, list):
+        return 0
+    for msg in messages:
+        try:
+            mid = int(getattr(msg, 'msg_id', 0) or 0)
+        except Exception:
+            mid = 0
+        if mid <= 0:
+            continue
+        if oldest <= 0 or mid < oldest:
+            oldest = mid
+    return oldest
+
+
+def request_older_history_if_needed(state, net, chan: Optional[str], force: bool = False) -> None:
+    """Fetch an older history page with before_id for the currently loaded channel."""
+    if _skip_history_request(chan):
+        return
+    if not isinstance(chan, str) or not chan:
+        return
+    try:
+        if chan in getattr(state, 'history_fetching', set()):
+            return
+        conv = getattr(state, 'conversations', {}).get(chan, [])
+        before_id = _oldest_loaded_history_id(conv)
+        if before_id <= 0:
+            return
+        exhausted_before = int(getattr(state, 'history_before_exhausted', {}).get(chan, 0) or 0)
+        if not force and exhausted_before > 0 and before_id >= exhausted_before:
+            return
+        room_like = (chan in getattr(state, 'groups', {})) or (chan in getattr(state, 'boards', {})) or chan.startswith('b-')
+        payload = {"type": "history", "before_id": before_id, "limit": 200}
+        if room_like:
+            payload["room"] = chan
+        else:
+            payload["peer"] = chan
+        net.send(payload)
+        try:
+            state.history_fetching.add(chan)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _history_row_to_message_and_record(state: 'ClientState', row: dict, room: Optional[str]) -> tuple[Optional[ChatMessage], Optional[dict], Optional[int]]:
+    if not isinstance(row, dict):
+        return None, None, None
+    rid = row.get('id')
+    frm = row.get('from')
+    to = row.get('to')
+    text = row.get('text', '')
+    ts = float(row.get('ts') or time.time())
+    delivered_flag = bool(row.get('delivered') or row.get('delivered_at'))
+    read_flag = bool(row.get('read') or row.get('read_at'))
+    new_status = None
+    if read_flag:
+        new_status = 'read'
+    elif delivered_flag:
+        new_status = 'delivered'
+    if room:
+        message = ChatMessage('in' if frm != state.self_id else 'out', text, ts, sender=frm, msg_id=rid)
+        if message.direction == 'out' and isinstance(rid, int):
+            message.status = new_status or 'sent'
+        record = {"id": rid, "from": frm, "text": text, "ts": ts, "room": room}
+        return message, record, rid if isinstance(rid, int) else None
+
+    direction = 'out' if frm == state.self_id else 'in'
+    message = ChatMessage(direction, text, ts, sender=frm, msg_id=rid)
+    if direction == 'out' and isinstance(rid, int):
+        message.status = new_status or 'sent'
+    record = {"id": rid, "from": frm, "to": to, "text": text, "ts": ts}
+    return message, record, rid if isinstance(rid, int) else None
+
+
+def _apply_history_result_rows(state: 'ClientState', chan: str, rows: list[dict], *, room: Optional[str], before_id: Optional[int]) -> int:
+    conv = state.conversations.setdefault(chan, [])
+    existing_ids = {m.msg_id for m in conv if getattr(m, 'msg_id', None) is not None}
+    is_older_page = isinstance(before_id, int) and before_id > 0
+    applied = 0
+
+    if is_older_page:
+        older_batch: list[ChatMessage] = []
+        for row in rows:
+            message, record, rid = _history_row_to_message_and_record(state, row, room)
+            if message is None or record is None:
+                continue
+            if rid is not None and rid in existing_ids:
+                continue
+            older_batch.append(message)
+            if rid is not None:
+                existing_ids.add(rid)
+                state.history_last_ids[chan] = max(state.history_last_ids.get(chan, 0), int(rid))
+            try:
+                append_history_record(record)
+            except Exception:
+                pass
+            applied += 1
+        if older_batch:
+            conv[:0] = older_batch
+            try:
+                state.history_before_exhausted.pop(chan, None)
+            except Exception:
+                pass
+        else:
+            try:
+                state.history_before_exhausted[chan] = int(before_id)
+            except Exception:
+                pass
+        return applied
+
+    for row in rows:
+        rid = row.get('id') if isinstance(row, dict) else None
+        frm = row.get('from') if isinstance(row, dict) else None
+        text = row.get('text', '') if isinstance(row, dict) else ''
+        ts = float(row.get('ts') or time.time()) if isinstance(row, dict) else time.time()
+        to = row.get('to') if isinstance(row, dict) else None
+        delivered_flag = bool(row.get('delivered') or row.get('delivered_at')) if isinstance(row, dict) else False
+        read_flag = bool(row.get('read') or row.get('read_at')) if isinstance(row, dict) else False
+        new_status = None
+        if read_flag:
+            new_status = 'read'
+        elif delivered_flag:
+            new_status = 'delivered'
+        if isinstance(rid, int) and rid in existing_ids:
+            continue
+        if room:
+            message, record, rid_int = _history_row_to_message_and_record(state, row, room)
+            if message is None or record is None:
+                continue
+            conv.append(message)
+            if rid_int is not None:
+                existing_ids.add(rid_int)
+            try:
+                append_history_record(record)
+            except Exception:
+                pass
+        else:
+            direction = 'out' if frm == state.self_id else 'in'
+            updated = False
+            if direction == 'out':
+                for m_old in reversed(conv):
+                    if m_old.direction == 'out' and getattr(m_old, 'msg_id', None) is None:
+                        if m_old.text == text:
+                            m_old.msg_id = rid
+                            if new_status:
+                                if m_old.status != 'read' or new_status == 'read':
+                                    m_old.status = new_status
+                            updated = True
+                            if isinstance(rid, int):
+                                existing_ids.add(rid)
+                            break
+            if not updated:
+                message, record, rid_int = _history_row_to_message_and_record(state, row, room)
+                if message is None or record is None:
+                    continue
+                conv.append(message)
+                if rid_int is not None:
+                    existing_ids.add(rid_int)
+                try:
+                    append_history_record(record)
+                except Exception:
+                    pass
+            else:
+                record = {"id": rid, "from": frm, "to": to, "text": text, "ts": ts}
+                try:
+                    append_history_record(record)
+                except Exception:
+                    pass
+        if isinstance(rid, int):
+            state.history_last_ids[chan] = max(state.history_last_ids.get(chan, 0), int(rid))
+            applied += 1
+    return applied
 
 
 def request_history_if_needed(state, net, chan: Optional[str], force: bool = False) -> None:
@@ -8660,6 +8862,8 @@ def main(stdscr):
                 rows = list(msg.get('rows', []))
                 room = msg.get('room')
                 peer = msg.get('peer')
+                before_raw = msg.get('before_id')
+                before_id = int(before_raw) if isinstance(before_raw, int) or (isinstance(before_raw, str) and before_raw.isdigit()) else None
                 _dbg(f"[recv history_result] room={room} peer={peer} rows={len(rows)}")
                 # clear pending flag
                 try:
@@ -8680,66 +8884,7 @@ def main(stdscr):
                 chan = (room if room else (str(peer) if peer else None))
                 if not chan:
                     continue
-                applied = 0
-                conv = state.conversations.setdefault(chan, [])
-                existing_ids = {m.msg_id for m in conv if getattr(m, 'msg_id', None) is not None}
-                for r in rows:
-                    rid = r.get('id')
-                    frm = r.get('from')
-                    to = r.get('to')
-                    text = r.get('text', '')
-                    ts = float(r.get('ts') or time.time())
-                    delivered_flag = bool(r.get('delivered') or r.get('delivered_at'))
-                    read_flag = bool(r.get('read') or r.get('read_at'))
-                    new_status = None
-                    if read_flag:
-                        new_status = 'read'
-                    elif delivered_flag:
-                        new_status = 'delivered'
-                    # Skip duplicates by msg_id if already present
-                    if isinstance(rid, int) and rid in existing_ids:
-                        continue
-                    if room:
-                        # group history row
-                        m = ChatMessage('in' if frm != state.self_id else 'out', text, ts, sender=frm, msg_id=rid)
-                        if m.direction == 'out' and isinstance(rid, int):
-                            m.status = new_status or 'sent'
-                        conv.append(m)
-                        if isinstance(rid, int):
-                            existing_ids.add(rid)
-                        rec = {"id": rid, "from": frm, "text": text, "ts": ts, "room": room}
-                    else:
-                        direction = 'out' if frm == state.self_id else 'in'
-                        # If this is our outgoing echo, try to update last pending message instead of duplicating
-                        updated = False
-                        if direction == 'out':
-                            for m_old in reversed(conv):
-                                if m_old.direction == 'out' and getattr(m_old, 'msg_id', None) is None:
-                                    if m_old.text == text:
-                                        m_old.msg_id = rid
-                                        if new_status:
-                                            # Upgrade status only if not downgrading read
-                                            if m_old.status != 'read' or new_status == 'read':
-                                                m_old.status = new_status
-                                        updated = True
-                                        if isinstance(rid, int):
-                                            existing_ids.add(rid)
-                                        break
-                        if not updated:
-                            m = ChatMessage(direction, text, ts, sender=frm, msg_id=rid)
-                            if direction == 'out' and isinstance(rid, int):
-                                m.status = new_status or 'sent'
-                            conv.append(m)
-                            if isinstance(rid, int):
-                                existing_ids.add(rid)
-                        rec = {"id": rid, "from": frm, "to": to, "text": text, "ts": ts}
-                    try:
-                        append_history_record(rec)
-                    except Exception:
-                        pass
-                    if isinstance(rid, int):
-                        state.history_last_ids[chan] = max(state.history_last_ids.get(chan, 0), int(rid))
-                        applied += 1
+                applied = _apply_history_result_rows(state, chan, rows, room=room if isinstance(room, str) and room else None, before_id=before_id)
                 if applied:
                     save_history_index(state.history_last_ids)
                     state.status = f"История обновлена: {chan} +{applied}"
@@ -15159,6 +15304,12 @@ def main(stdscr):
                 page = max(1, int(getattr(state, 'last_hist_h', 3)) - 1)
                 state.history_scroll += page
                 _clamp_history_scroll(state)
+                if _history_scroll_at_top(state):
+                    try:
+                        sel = current_selected_id(state)
+                        request_older_history_if_needed(state, net, sel)
+                    except Exception:
+                        pass
             elif ch == curses.KEY_NPAGE:  # PageDown
                 page = max(1, int(getattr(state, 'last_hist_h', 3)) - 1)
                 state.history_scroll = max(0, state.history_scroll - page)
@@ -15170,6 +15321,12 @@ def main(stdscr):
                     step = 3
                 state.history_scroll += step
                 _clamp_history_scroll(state)
+                if _history_scroll_at_top(state):
+                    try:
+                        sel = current_selected_id(state)
+                        request_older_history_if_needed(state, net, sel)
+                    except Exception:
+                        pass
             elif ch == getattr(curses, 'KEY_SF', 262):  # Scroll wheel down (ncurses alias)
                 try:
                     step = max(1, int(getattr(state, 'last_hist_h', 3)) // 2)

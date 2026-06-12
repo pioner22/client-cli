@@ -311,6 +311,7 @@ except Exception:
         "GROUP_INVITE": "group_invite",
         "GROUP_INVITE_RESULT": "group_invite_result",
         "GROUP_INVITE_RESPONSE": "group_invite_response",
+        "GROUP_INVITE_RESPONSE_RESULT": "group_invite_response_result",
         # Boards
         "BOARDS": "boards",
         "BOARD_CREATE": "board_create",
@@ -837,7 +838,7 @@ except Exception:
     def get_file_system_suggestions(token: str, cwd=None, limit: int = 20):
         return []
 
-CLIENT_VERSION = "0.4.2185"
+CLIENT_VERSION = "0.4.2188"
 _VER_PART_RE = re.compile(r"\d+")
 
 
@@ -10338,7 +10339,7 @@ def main(stdscr):
                             state.action_menu_index = 0
                 except Exception:
                     pass
-            elif mtype == 'group_invite_result':
+            elif mtype in ('group_invite_result', 'group_invite_response_result'):
                 try:
                     gid = str(msg.get('group_id') or '')
                     if gid:

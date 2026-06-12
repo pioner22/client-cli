@@ -145,6 +145,7 @@ class T:
     GROUP_INVITE = "group_invite"
     GROUP_INVITE_RESULT = "group_invite_result"
     GROUP_INVITE_RESPONSE = "group_invite_response"
+    GROUP_INVITE_RESPONSE_RESULT = "group_invite_response_result"
 
     # Boards (Доски)
     BOARDS = "boards"
